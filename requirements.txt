@@ -1,0 +1,4 @@
+cryptograpy
+fastapi
+uvicorn
+argon2-cffi
