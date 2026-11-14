@@ -1,9 +1,12 @@
 venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.sqlite3
 *.db
-.db-journal
+*.bd
+*.db-journal
 .env
 *.pem
 *.key
+*_vault.json
