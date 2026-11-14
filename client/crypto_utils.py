@@ -133,19 +133,19 @@ def decrypt_aes_gcm(
     return aesgcm.decrypt(nonce, ciphertext, associated_data)
 
 # VERIFICACIOND E IDENTIDAD
-def compute_sefty_number(ik_a_pub: bytes, ik_b_pub: bytes) -> str:
+def compute_safety_number(ik_a_pub: bytes, ik_b_pub: bytes) -> str:
     """ Calcula el Safety Numeber = SHA-256(IKA || IKB) 
         formateandolos en bloques legibels
         Ordenamos ambas claves para que A y B obtengan exactamente
         el mismo numero 
     """
     
-    ordered = sorted([ik_a_pub, ik_a_pub])
+    ordered = sorted([ik_a_pub, ik_b_pub])
     digest = hashlib.sha256(ordered[0] + ordered[1]).hexdigest()
     #agruamos los primeros 60 caracteres hex en 12 bloques de 5
     #para una lectura mas comoda en la consola
-    blocks = [digest[i:i+5].upper() for i in range (0, 60 , 5)]
-    return " ".join()(blocks)
+    blocks = [digest[i:i+5].upper() for i in range(0, 60, 5)]
+    return " ".join(blocks)
 
 
 #  ALMACENAMIENTO LOCAL DEL CIFRADO con (argon2ID + AES-256-GCM)
@@ -173,9 +173,9 @@ def save_encrypted_vault(filepath: str, password: str, data: dict) -> None:
     nonce, ciphertext, = encrypt_aes_gcm(key, plaintext)
     
     vault_payload = {
-        "salt": base64.b64decode(salt).decode("ascii"),
-        "nonce": base64.b64decode(nonce).decode("ascii"),
-        "ciphertext": base64.b64decode(ciphertext).decode("ascii")
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
     }
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(vault_payload, f, indent=2)
@@ -188,10 +188,9 @@ def load_encrypted_vault(filepath: str, password: str) -> dict:
     with open(filepath, "r", encoding="utf-8") as f:
         vault_payload = json.load(f)
         
-    salt = base64.b64decode(salt).decode("ascii"),
-    nonce = base64.b64decode(nonce).decode("ascii"),
-    ciphertext = base64.b64decode(ciphertext).decode("ascii")
-    
+    salt = base64.b64decode(vault_payload["salt"])
+    nonce = base64.b64decode(vault_payload["nonce"])
+    ciphertext = base64.b64decode(vault_payload["ciphertext"])
     
     key = derive_storage_key(password, salt)
     plaintext = decrypt_aes_gcm(key, nonce, ciphertext)
