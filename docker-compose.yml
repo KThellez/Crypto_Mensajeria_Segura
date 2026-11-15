@@ -1,0 +1,10 @@
+services:
+  server:
+    build: .
+    container_name: cripto_e2ee_server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./server:/app/server
+      - ./certs:/app/certs
+    restart: unless-stopped
