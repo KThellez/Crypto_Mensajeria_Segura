@@ -28,6 +28,10 @@ from client.crypto_utils import (
 
 HKDF_INFO_X3DH = b"UDFJC_Crypto_X3DH_RootKey_v1"
 
+# Maximo de mensajes perdidos que el receptor acepta saltar en un solo paso
+# (mismo concepto que MAX_SKIP en la especificacion del Double Ratchet de Signal)
+MAX_SKIP = 1000
+
 @dataclass
 class PreKeyBundle:
     """ Paquete publico de un usuario descargado
@@ -165,15 +169,26 @@ class ChatSession:
         """
         return sender_ik + receiver_ik + struct.pack(">Q", counter)
     
+    @staticmethod
+    def _kdf_chain(chain_key: bytes) -> Tuple[bytes, bytes]:
+        """
+            Toma la llave actual de la cadena (CK_n) y la pasa por una función de un solo 
+            sentido (con ello un atacante ya no puede volver atras) usando dos constantes 
+            distintas para obtener dos claves diferentes:
+                MK_n     = HMAC-SHA256(CK_n, 0x01)  -> clave de este mensaje (se usa y se borra)
+                CK_{n+1} = HMAC-SHA256(CK_n, 0x02)  -> siguiente clave de cadena (para el futuro)
+        """
+        msg_key = compute_hmac_sha256(chain_key, b"\x01")
+        next_chain_key = compute_hmac_sha256(chain_key, b"\x02")
+        return msg_key, next_chain_key
+
     def _step_ratchet(self) -> Tuple[bytes, int]:
         """
-            Cifra un mensaje avanzando el ratchet simétrico (Forward Secrecy).
-                1. Deriva MK_n (para este mensaje) y CK_{n+1} (para el siguiente).
-                2. Cifra con AES-256-GCM vinculando identidades y contador en AD.
-                3. Destruye MK_n inmediatamente tras cifrar.
+            Avanza el ratchet simétrico un paso (Forward Secrecy):
+            deriva MK_n, reemplaza CK_n por CK_{n+1} y devuelve (MK_n, n).
+            CK_n se sobrescribe, por lo que no se puede volver atrás.
         """
-        msg_key = compute_hmac_sha256(self.chain_key, b"\x01")
-        self.chain_key = compute_hmac_sha256(self.chain_key, b"\02")
+        msg_key, self.chain_key = self._kdf_chain(self.chain_key)
         return msg_key, self.send_counter
     
     def encrypt_message(self, plaintext: str) -> EncryptedPacket:
@@ -218,24 +233,35 @@ class ChatSession:
         # Mitigacion Stride (Manipulacion / Replay): rechazar contadores repetidos o pasados
         if packet.counter in self.received_counters or packet.counter < self.send_counter:
             raise ValueError(f"ALERTA DE SEGURIDAD: Mensaje repetido o fuera de orden (n={packet.counter})")
-        
-        #Avanzar la cadena si algun mensaje previo se perdio en red hasta llegar a packet.counter
-        while self.send_counter < packet.counter:
-            _, _ = self._step_ratchet()
-            self.send_counter += 1
-            
-        msg_key, _ = self._step_ratchet()
-        self.send_counter +=1
-        
+
+        # Mitigacion (Denegacion de servicio): un contador enorme obligaria a calcular
+        # millones de HMAC. Se limita cuantos mensajes perdidos se pueden saltar.
+        skipped = packet.counter - self.send_counter
+        if skipped > MAX_SKIP:
+            raise ValueError(
+                f"ALERTA DE SEGURIDAD: Contador demasiado adelantado (n={packet.counter}, "
+                f"esperado <= {self.send_counter + MAX_SKIP})"
+            )
+
+        # El ratchet se avanza sobre una COPIA local de la cadena. El estado de la sesion
+        # solo se modifica si la etiqueta GCM es valida: asi un paquete falso con un
+        # contador alto no puede desincronizar la sesion (ver test_forged_packet_*).
+        chain_key = self.chain_key
+        for _ in range(skipped):        # Mensajes previos perdidos en la red
+            _, chain_key = self._kdf_chain(chain_key)
+        msg_key, next_chain_key = self._kdf_chain(chain_key)
+
         # Construir el mismo AD esperado (emisor -> receptor local -> contador)
         ad = self._build_associated_data(self.peer_ik_dh_pub, self.local_ik_dh_pub, packet.counter)
-        
-        
+
         try:
             plaintext_bytes = decrypt_aes_gcm(msg_key, packet.nonce, packet.ciphertext, associated_data=ad)
         finally:
-            # Garantiza borrar el MK_n si el decifrado falla por mainipulacion
+            # Garantiza borrar el MK_n si el descifrado falla por manipulacion
             del msg_key
-            
+
+        # Descifrado autentico: ahora si se confirma el avance del ratchet
+        self.chain_key = next_chain_key
+        self.send_counter = packet.counter + 1
         self.received_counters.add(packet.counter)
-        return plaintext_bytes.decode("utf-8")        
+        return plaintext_bytes.decode("utf-8")

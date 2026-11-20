@@ -423,11 +423,16 @@ class SecureClient:
             sender_ik_dh = b64d(msg["sender_ik_dh"])
             ephemeral_pub = b64d(msg["ephemeral_pub"])
 
-            if sender not in self.sessions:
-                self._check_identity_pinning(sender, sender_ik_dh)
-                self.sessions[sender] = ChatSession.accept_x3dh(
+            # Sesion nueva: se crea de forma provisional y solo se guarda (junto con la
+            # identidad del contacto) si el primer mensaje descifra correctamente.
+            # Asi un paquete falso no deja una sesion inservible ni fija una clave falsa.
+            is_new_session = sender not in self.sessions
+            if is_new_session:
+                session = ChatSession.accept_x3dh(
                     local_ik_priv, local_ik_pub, local_spk_priv, sender_ik_dh, ephemeral_pub
                 )
+            else:
+                session = self.sessions[sender]
 
             packet = EncryptedPacket(
                 sender_ik_dh=sender_ik_dh,
@@ -437,11 +442,21 @@ class SecureClient:
                 ciphertext=b64d(msg["ciphertext"]),
             )
 
+            # Prueba: Intenta abrir el mensaje, si el paquete
+            # estaba alterado o es falso, no se guarda 
+            # la sesión ni la identidad del contacto.
             try:
-                plaintext = self.sessions[sender].decrypt_message(packet)
+                plaintext = session.decrypt_message(packet)
             except Exception as exc:
-                print(f"\n[RECHAZADO de @{sender}]: {exc}")
+                reason = str(exc) or "etiqueta GCM inválida (paquete alterado o falso)"
+                print(f"\n[RECHAZADO de @{sender}]: {type(exc).__name__}: {reason}")
                 continue
+
+            # Si logro tener exito el primer mensaje, 
+            # fija la identidad del contacto y guarda la sesión
+            if is_new_session:
+                self._check_identity_pinning(sender, sender_ik_dh)
+                self.sessions[sender] = session
 
             record = {"dir": "IN", "peer": sender, "text": plaintext, "ts": _now()}
             self.vault["history"].append(record)
