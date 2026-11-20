@@ -49,12 +49,13 @@ def sign_prekey(ik_sig_priv: ed25519.Ed25519PrivateKey, spk_pub_bytes: bytes) ->
     """
     return ik_sig_priv.sign(spk_pub_bytes)
 
-def verify_prekey_signature(ik_sig_priv_bytes: bytes, spk_pub_bytes: bytes , signature: bytes) -> bool:
-    """ Verifica que la SPK fue firmada legitimamente por 
-        el dueño de IK_sig (Identity Key Signature)
+def verify_prekey_signature(ik_sig_pub_bytes: bytes, spk_pub_bytes: bytes , signature: bytes) -> bool:
+    """ Verifica que la SPK fue firmada legitimamente por
+        el dueño de IK_sig (Identity Key Signature).
+        Recibe la clave PUBLICA Ed25519 del dueño (nunca la privada).
     """
     try:
-        pub_key = ed25519.Ed25519PublicKey.from_public_bytes(ik_sig_priv_bytes)
+        pub_key = ed25519.Ed25519PublicKey.from_public_bytes(ik_sig_pub_bytes)
         pub_key.verify(signature, spk_pub_bytes)
         return True
     except InvalidSignature:
@@ -133,14 +134,23 @@ def decrypt_aes_gcm(
     return aesgcm.decrypt(nonce, ciphertext, associated_data)
 
 # VERIFICACIOND E IDENTIDAD
-def compute_safety_number(ik_a_pub: bytes, ik_b_pub: bytes) -> str:
-    """ Calcula el Safety Numeber = SHA-256(IKA || IKB) 
-        formateandolos en bloques legibels
-        Ordenamos ambas claves para que A y B obtengan exactamente
-        el mismo numero 
+def identity_material(ik_sig_pub: bytes, ik_dh_pub: bytes) -> bytes:
+    """ Identidad criptografica completa de un usuario: IK_sig (Ed25519) || IK_dh (X25519).
+        Ambas claves deben entrar en el Safety Number: si solo entrara IK_dh, el servidor
+        podria sustituir IK_sig (y firmar una SPK propia) sin que el numero cambiara.
     """
-    
-    ordered = sorted([ik_a_pub, ik_b_pub])
+    return ik_sig_pub + ik_dh_pub
+
+
+def compute_safety_number(identity_a: bytes, identity_b: bytes) -> str:
+    """ Calcula el Safety Number = SHA-256(ID_menor || ID_mayor)
+        donde ID = identity_material(IK_sig, IK_dh) de cada usuario,
+        formateandolo en bloques legibles.
+        Ordenamos ambas identidades para que A y B obtengan exactamente
+        el mismo numero
+    """
+
+    ordered = sorted([identity_a, identity_b])
     digest = hashlib.sha256(ordered[0] + ordered[1]).hexdigest()
     #agruamos los primeros 60 caracteres hex en 12 bloques de 5
     #para una lectura mas comoda en la consola
