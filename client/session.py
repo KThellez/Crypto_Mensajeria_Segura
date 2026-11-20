@@ -1,5 +1,15 @@
-#Establecimiento de sesion (X3DH)
+"""
+    Modúlo Client/Session.py
+    Gestiona el estado criptografico de la sesion de chat entre dos pares
+    usando el protocolo X3DH + Ratchet.
 
+    Mapa de flujo de la sesion:
+        1. PreKeyBundle: Tarjeta de presentacion publica que se descarga del servidor.
+        2. initiate_x3dh: Emisor que verifica la firma Ed25519, calcula DH1, DH2 , DH3, deriva RK y borra el EK.
+        3. Receptor replica los mismos 3 productos DH, usando su SPK privada.
+        4. Avanza el ratchet(HMAC), vincula identidades en AD y borra el MK_n despues de cifrar/descifrar.  
+
+"""
 import struct
 from dataclasses import dataclass, field
 from typing import Set, Tuple
@@ -22,26 +32,33 @@ HKDF_INFO_X3DH = b"UDFJC_Crypto_X3DH_RootKey_v1"
 class PreKeyBundle:
     """ Paquete publico de un usuario descargado
         desde el directorio del servidor
+
+        Claves publicas de un destinatario obtenidas desde el servidor ciego
     """
-    ik_sig_pub: bytes   #32B Ed25519
-    ik_dh_pub: bytes    #32B X25519
-    spk_pub: bytes      #32B X25519
-    spk_sig: bytes      #64B Firma Ed25519 sobre el spk_pub
+    ik_sig_pub: bytes   # Clave publica Ed25519 (32B), para verificar autenticidad    
+    ik_dh_pub: bytes    # Clave publica X25519 (32B), para el intercambio Diffie-Hellman (identidad a largo plazo)
+    spk_pub: bytes      # Signed PreKey X25519 (32B), para el intercambio Diffie-Hellman (firmada por ik_sig_priv)
+    spk_sig: bytes      # Firma Ed25519 (64B) permite probar que spk_pub pertenece al dueño (ik_sig_pub), evitando MITM
 
 @dataclass
 class EncryptedPacket:
-    """Estructura enviada al buzon del servidor"""
-    sender_ik_dh: bytes
-    ephemeral_pub: bytes #Necesaria en el primer mensaje para que el receptor complete el X3DH
-    counter: int
-    nonce: bytes
-    ciphertext: bytes
-    
+    """ Estructura enviada al buzon del servidor
+        Estructura del paquete cifrado que viaja por red y reposa en el buzon del servidor. 
+        Contiene la informacion necesaria para que el receptor derive 
+        la misma clave de cifrado y descifre el mensaje.
+    """
+    sender_ik_dh: bytes     # Identidad DH del emisor (Necesaria para calcular DH2 Y AD)
+    ephemeral_pub: bytes    # Clave publica efimera EK_A (Necesaria en el primer mensaje para que el receptor complete el X3DH)
+    counter: int            # Numero de secuencia del mensaje (anti-replay y orden de entrega)
+    nonce: bytes            # Vector de inicializacion unico de 12 bytes (AES-GCM 96 bits)
+    ciphertext: bytes       # Texto cifrado + Tag de autenticacion GCM de 16 bytes (AES-GCM 128 bits)   
     
 @dataclass
 class ChatSession:
     """ Gestiona el estado criptografico (X3DH + Ratchet)
         entre el usuario local y un par
+
+        Mantiene el estado activo del ratchet para un par de usuarios.
     """
     local_ik_dh_pub: bytes
     peer_ik_dh_pub: bytes
@@ -59,8 +76,16 @@ class ChatSession:
         peer_bundle: PreKeyBundle,
     ) -> "ChatSession":
         """
-        Fase 3 (El Emisor): Verifica la SPK del receptor, calcula el DH1 | DH2 | DH3 
-                            y deriva RK
+            Inicia una sesion X3DH (emisor)
+            pasos:
+                1. Verifica la firma ED25519 de la SPK del receptor. Si falla, aborta (detiene los MITM)
+                2. Genera clave efimera x25519 (EK) exclusiva para esta sesion
+                3. Calcula los 3 productos Diffie-Hellman (DH1, DH2, DH3)
+                4. Deriva la clave raiz RK con HKDF-SHA256
+                    4.1: DH1 = con X25519(IK_A_priv, SPK_B_pub) Autentica a Alicia ante bob
+                    4.2: DH2 = con X25519(EK_A_priv, IK_B_pub) Autentica a Bob ante Alicia
+                    4.3: DH3 = con X25519(EK_A_priv, SPK_B_pub) Aporta secreto efimero a la session (forward secrecy)
+                5. Borra la clave efimera EK y los productos DH de memoria
         """
         
         #Mitigacion STRIDE (Suplantacion): aborta si la firma de la SPK no es valida
@@ -108,8 +133,9 @@ class ChatSession:
         sender_ephemeral_pub: bytes,
     ) -> "ChatSession":
         """
-        Fase 3 (Receptor): Repite los 3 calculos DH usando sus claves para
-                            obtener la misma clave raiz RK
+            Acepta una sesión X3DH entrante (lado del receptor / Bob).
+            Por la propiedad conmutativa de Diffie-Hellman (g^{ab} = g^{ba}), Bob obtiene
+            exactamente los mismos bytes en DH1, DH2 y DH3 y deriva la misma clave raíz RK.
         """
         dh1 = compute_dh(local_spk_priv, sender_ik_dh_pub)
         dh2 = compute_dh(local_ik_dh_priv, sender_ephemeral_pub)
@@ -133,18 +159,18 @@ class ChatSession:
         receiver_ik: bytes, 
         counter:int,
         ) -> bytes:
-        """ Construye 
-                AD = IK_Emisor 
-                IK_receptor
-                n (entero de 8 bytes big-endian)
+        """ 
+            Construye el contexto autenticado (AD = IK_emisor || IK_receptor || n (entero de 8 bytes big-endian)).
+            Impide que un atacante reasigne un mensaje a otro destinatario o altere su secuencia.
         """
         return sender_ik + receiver_ik + struct.pack(">Q", counter)
     
     def _step_ratchet(self) -> Tuple[bytes, int]:
         """
-        Fase 4 
-                Deriva Mk_n = HMAC(CK_n,0x01)
-                Avanza CK_{n+1} = HMAC(CK_n, 0x02)
+            Cifra un mensaje avanzando el ratchet simétrico (Forward Secrecy).
+                1. Deriva MK_n (para este mensaje) y CK_{n+1} (para el siguiente).
+                2. Cifra con AES-256-GCM vinculando identidades y contador en AD.
+                3. Destruye MK_n inmediatamente tras cifrar.
         """
         msg_key = compute_hmac_sha256(self.chain_key, b"\x01")
         self.chain_key = compute_hmac_sha256(self.chain_key, b"\02")
@@ -184,6 +210,9 @@ class ChatSession:
     def decrypt_message(self, packet: EncryptedPacket) -> str:
         """ Verifica orden/anti-replay, avanza el rachet hasta el contador
             del paquete y descifra
+
+            - Si el contador ya fue procesado -> Lanza ValueError (bloquea Replay).
+            - Si el ciphertext o AD fueron modificados -> AES-GCM lanza InvalidTag (bloquea Tampering).
         """
         
         # Mitigacion Stride (Manipulacion / Replay): rechazar contadores repetidos o pasados
