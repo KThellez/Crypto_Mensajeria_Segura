@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import pytest
 
@@ -93,3 +95,24 @@ def test_history_records_timestamp_and_filter(alicia_bob):
     assert [m["text"] for m in received] == ["Hola Bob"]
     assert bob.get_history("alicia")[0]["ts"]
     assert bob.get_history("eva") == []
+
+
+def test_forged_first_packet_does_not_create_session_or_pin(alicia_bob):
+    alicia, bob = alicia_bob
+
+    # Un atacante deposita en el buzón de Bob un primer paquete falso "de alicia"
+    httpx.post("/messages", headers=alicia._auth_headers(), json={
+        "recipient": "bob",
+        "sender_ik_dh": b64e(generate_x25519_keypair()[1]),
+        "ephemeral_pub": b64e(generate_x25519_keypair()[1]),
+        "counter": 0,
+        "nonce": b64e(os.urandom(12)),
+        "ciphertext": b64e(os.urandom(40)),
+    })
+    assert bob.check_inbox() == []
+    assert "alicia" not in bob.sessions
+    assert "alicia" not in bob.vault["known_contacts"]
+
+    # El primer mensaje legítimo sigue funcionando
+    alicia.send_message("bob", "Hola de verdad")
+    assert [m["text"] for m in bob.check_inbox()] == ["Hola de verdad"]
