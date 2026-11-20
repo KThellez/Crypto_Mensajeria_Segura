@@ -26,9 +26,11 @@ from client.crypto_utils import (
     compute_safety_number,
     generate_ed25519_keypair,
     generate_x25519_keypair,
+    identity_material,
     load_encrypted_vault,
     save_encrypted_vault,
     sign_prekey,
+    verify_prekey_signature,
 )
 from client.session import ChatSession, EncryptedPacket, PreKeyBundle
 
@@ -135,11 +137,25 @@ class SecureClient:
             )
 
     def _ensure_vault_schema(self) -> None:
-        """Compatibilidad con bóvedas creadas antes del directorio de contactos."""
-        self.vault.setdefault("known_contacts", {})
-        self.vault.setdefault("verified_contacts", [])
+        """Compatibilidad con bóvedas creadas con versiones anteriores del cliente."""
+        known = self.vault.setdefault("known_contacts", {})
+        verified = self.vault.setdefault("verified_contacts", [])
         self.vault.setdefault("sessions", {})
         self.vault.setdefault("history", [])
+
+        # Formato antiguo: {usuario: ik_dh_pub_b64}. Se migra a la identidad completa;
+        # la clave de firma se fija la próxima vez que se descargue el bundle del contacto.
+        # El Safety Number antiguo solo cubría IK_dh, así que la verificación previa ya no vale.
+        revoked = []
+        for peer, entry in list(known.items()):
+            if isinstance(entry, str):
+                known[peer] = {"ik_sig_pub": None, "ik_dh_pub": entry}
+                if peer in verified:
+                    verified.remove(peer)
+                    revoked.append(peer)
+        if revoked:
+            print("[AVISO] El Safety Number ahora incluye también la clave de firma (Ed25519).")
+            print(f"  Vuelve a verificar a: {', '.join('@' + p for p in revoked)}")
 
     # ------------------------------------------------------------------
     # Fases 1 y 2: registro y login
@@ -180,7 +196,8 @@ class SecureClient:
                 "spk_priv": priv_to_b64(spk_priv),
                 "spk_pub": b64e(spk_pub),
             },
-            "known_contacts": {},     # {usuario: ik_dh_pub_b64}  (Identity Pinning / TOFU)
+            # {usuario: {"ik_sig_pub": b64, "ik_dh_pub": b64}}  (Identity Pinning / TOFU)
+            "known_contacts": {},
             "verified_contacts": [],  # Contactos verificados vía Safety Number / QR
             "sessions": {},
             "history": [],
@@ -235,34 +252,74 @@ class SecureClient:
     # ------------------------------------------------------------------
     # Fase 5: directorio de contactos y verificación
     # ------------------------------------------------------------------
-    def _check_identity_pinning(self, peer: str, peer_ik_dh_pub: bytes) -> None:
+    def _safety_number_with(self, peer_ik_sig_pub: bytes, peer_ik_dh_pub: bytes) -> str:
+        """Safety Number sobre la identidad completa (IK_sig || IK_dh) de ambos usuarios."""
+        keys = self.vault["keys"]
+        local_identity = identity_material(b64d(keys["ik_sig_pub"]), b64d(keys["ik_dh_pub"]))
+        return compute_safety_number(local_identity, identity_material(peer_ik_sig_pub, peer_ik_dh_pub))
+
+    def _check_identity_pinning(self, peer: str, peer_ik_sig_pub: bytes, peer_ik_dh_pub: bytes) -> None:
         """ Fase 5 / STRIDE (Suplantación):
-                TOFU: fija la clave de identidad la primera vez que se ve.
-                Si después cambia, alerta y revoca el estado VERIFICADO.
+                TOFU: fija la identidad completa (IK_sig + IK_dh) la primera vez que se ve.
+                Si después cambia cualquiera de las dos claves, alerta y revoca el estado VERIFICADO.
         """
         known_contacts = self.vault["known_contacts"]
         known = known_contacts.get(peer)
-        peer_ik_b64 = b64e(peer_ik_dh_pub)
-        local_ik_pub = b64d(self.vault["keys"]["ik_dh_pub"])
-        safety_num = compute_safety_number(local_ik_pub, peer_ik_dh_pub)
+        new_identity = {"ik_sig_pub": b64e(peer_ik_sig_pub), "ik_dh_pub": b64e(peer_ik_dh_pub)}
+        safety_num = self._safety_number_with(peer_ik_sig_pub, peer_ik_dh_pub)
 
         if known is None:
-            known_contacts[peer] = peer_ik_b64
+            known_contacts[peer] = new_identity
             print(f"\n[NUEVO CONTACTO] @{peer} añadido al directorio como [NO VERIFICADO].")
             print(f"  Safety Number: {safety_num}\n")
-        elif known != peer_ik_b64:
-            known_contacts[peer] = peer_ik_b64
-            was_verified = peer in self.vault["verified_contacts"]
-            if was_verified:
-                self.vault["verified_contacts"].remove(peer)
-            print("\n" + "!" * 60)
-            print(f"ALERTA DE SEGURIDAD: La clave de identidad de '{peer}' CAMBIÓ.")
-            print("Posible ataque de suplantación (MITM).")
-            if was_verified:
-                print("Se revocó su estado [VERIFICADO].")
-            print(f"Nuevo Safety Number: {safety_num}")
-            print("Vuelve a verificarlo en persona antes de confiar en este contacto.")
-            print("!" * 60 + "\n")
+            return
+
+        # Contacto migrado de una bóveda antigua: solo se conocía IK_dh. Si coincide,
+        # se completa la identidad con la clave de firma (TOFU sobre IK_sig).
+        if known["ik_sig_pub"] is None and known["ik_dh_pub"] == new_identity["ik_dh_pub"]:
+            known["ik_sig_pub"] = new_identity["ik_sig_pub"]
+            return
+
+        if known == new_identity:
+            return
+
+        changed = [
+            name for field, name in (("ik_sig_pub", "firma Ed25519"), ("ik_dh_pub", "acuerdo X25519"))
+            if known[field] != new_identity[field]
+        ]
+        known_contacts[peer] = new_identity
+        was_verified = peer in self.vault["verified_contacts"]
+        if was_verified:
+            self.vault["verified_contacts"].remove(peer)
+        print("\n" + "!" * 60)
+        print(f"ALERTA DE SEGURIDAD: La clave de identidad de '{peer}' CAMBIÓ ({', '.join(changed)}).")
+        print("Posible ataque de suplantación (MITM).")
+        if was_verified:
+            print("Se revocó su estado [VERIFICADO].")
+        print(f"Nuevo Safety Number: {safety_num}")
+        print("Vuelve a verificarlo en persona antes de confiar en este contacto.")
+        print("!" * 60 + "\n")
+
+    def _fetch_sender_identity(self, sender: str, sender_ik_dh: bytes) -> Optional[bytes]:
+        """
+        Lado receptor: el paquete solo trae IK_dh del emisor. Se descarga su bundle para
+        obtener IK_sig y se exige que sea coherente:
+            - el IK_dh del directorio coincide con el usado en el X3DH del paquete, y
+            - la SPK del bundle está firmada por ese IK_sig.
+        Devuelve IK_sig, o None si el servidor entrega una identidad incoherente.
+        """
+        bundle = self._fetch_bundle(sender)
+        if bundle is None:
+            return None
+        if not hmac.compare_digest(bundle.ik_dh_pub, sender_ik_dh):
+            print(f"\n[ALERTA DE SEGURIDAD] El directorio publica para @{sender} una clave X25519")
+            print("  distinta a la usada en su mensaje. Posible MITM: mensaje descartado.")
+            return None
+        if not verify_prekey_signature(bundle.ik_sig_pub, bundle.spk_pub, bundle.spk_sig):
+            print(f"\n[ALERTA DE SEGURIDAD] La firma de la Signed PreKey de @{sender} no es válida.")
+            print("  Posible MITM: mensaje descartado.")
+            return None
+        return bundle.ik_sig_pub
 
     def is_verified(self, peer: str) -> bool:
         return peer in self.vault.get("verified_contacts", [])
@@ -296,12 +353,14 @@ class SecureClient:
         if peer == self.username:
             print("[INFO] No puedes añadirte a ti mismo como contacto.")
             return False
-        if peer in self.vault["known_contacts"]:
+        known = self.vault["known_contacts"].get(peer)
+        if known is not None and known["ik_sig_pub"] is not None:
             return True
+        # Contacto nuevo, o migrado sin clave de firma: se descarga y fija su identidad
         bundle = self._fetch_bundle(peer)
         if bundle is None:
             return False
-        self._check_identity_pinning(peer, bundle.ik_dh_pub)
+        self._check_identity_pinning(peer, bundle.ik_sig_pub, bundle.ik_dh_pub)
         self._save_state()
         return True
 
@@ -309,8 +368,8 @@ class SecureClient:
         """Safety Number con un contacto del directorio (lo añade si es nuevo)."""
         if not self.add_contact(peer):
             return None
-        local_ik_pub = b64d(self.vault["keys"]["ik_dh_pub"])
-        return compute_safety_number(local_ik_pub, b64d(self.vault["known_contacts"][peer]))
+        known = self.vault["known_contacts"][peer]
+        return self._safety_number_with(b64d(known["ik_sig_pub"]), b64d(known["ik_dh_pub"]))
 
     def show_safety_number(self, peer: str) -> Optional[str]:
         """ Fase 5
@@ -359,7 +418,7 @@ class SecureClient:
             bundle = self._fetch_bundle(recipient)
             if bundle is None:
                 return
-            self._check_identity_pinning(recipient, bundle.ik_dh_pub)
+            self._check_identity_pinning(recipient, bundle.ik_sig_pub, bundle.ik_dh_pub)
 
             local_ik_priv = x25519.X25519PrivateKey.from_private_bytes(
                 b64d(self.vault["keys"]["ik_dh_priv"])
@@ -455,7 +514,10 @@ class SecureClient:
             # Si logro tener exito el primer mensaje, 
             # fija la identidad del contacto y guarda la sesión
             if is_new_session:
-                self._check_identity_pinning(sender, sender_ik_dh)
+                sender_ik_sig = self._fetch_sender_identity(sender, sender_ik_dh)
+                if sender_ik_sig is None:
+                    continue
+                self._check_identity_pinning(sender, sender_ik_sig, sender_ik_dh)
                 self.sessions[sender] = session
 
             record = {"dir": "IN", "peer": sender, "text": plaintext, "ts": _now()}
