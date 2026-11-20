@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import httpx
+import httpx2
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
@@ -60,7 +60,7 @@ def priv_to_b64(priv_key) -> str:
 
 
 def _http_kwargs() -> dict:
-    """Opciones TLS para httpx: confía en el certificado del servidor si se configuró."""
+    """Opciones TLS para httpx2: confía en el certificado del servidor si se configuró."""
     return {"verify": SSL_CERT_FILE} if SSL_CERT_FILE else {}
 
 
@@ -183,7 +183,7 @@ class SecureClient:
             "spk_sig": b64e(spk_sig),
         }
 
-        res = httpx.post(f"{SERVER_URL}/register", json=payload, **_http_kwargs())
+        res = httpx2.post(f"{SERVER_URL}/register", json=payload, **_http_kwargs())
         if res.status_code != 201:
             raise RuntimeError(f"Error al registrar en servidor: {res.text}")
 
@@ -220,7 +220,7 @@ class SecureClient:
 
         self._ensure_vault_schema()
 
-        res = httpx.post(
+        res = httpx2.post(
             f"{SERVER_URL}/login",
             json={"username": self.username, "password": self.password},
             **_http_kwargs(),
@@ -237,7 +237,7 @@ class SecureClient:
 
     def _fetch_bundle(self, peer: str) -> Optional[PreKeyBundle]:
         """Descarga el PreKey Bundle público de un usuario desde el directorio del servidor."""
-        res = httpx.get(f"{SERVER_URL}/keys/{peer}", headers=self._auth_headers(), **_http_kwargs())
+        res = httpx2.get(f"{SERVER_URL}/keys/{peer}", headers=self._auth_headers(), **_http_kwargs())
         if res.status_code != 200:
             print(f"[ERROR] No se pudo obtener el bundle de '{peer}': {res.text}")
             return None
@@ -439,7 +439,7 @@ class SecureClient:
             "ciphertext": b64e(packet.ciphertext),
         }
 
-        res = httpx.post(
+        res = httpx2.post(
             f"{SERVER_URL}/messages", json=payload, headers=self._auth_headers(), **_http_kwargs()
         )
         if res.status_code == 201:
@@ -458,7 +458,7 @@ class SecureClient:
             completa X3DH si es sesión nueva y descifra
         """
 
-        res = httpx.get(f"{SERVER_URL}/messages", headers=self._auth_headers(), **_http_kwargs())
+        res = httpx2.get(f"{SERVER_URL}/messages", headers=self._auth_headers(), **_http_kwargs())
         if res.status_code != 200:
             print(f"[ERROR al consultar buzón]: {res.text}")
             return []

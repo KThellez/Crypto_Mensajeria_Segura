@@ -1,6 +1,6 @@
 import os
 
-import httpx
+import httpx2
 import pytest
 
 from fastapi.testclient import TestClient
@@ -13,14 +13,14 @@ from server.main import app
 
 @pytest.fixture(autouse=True)
 def isolated_env(tmp_path, monkeypatch):
-    """Aísla BD, bóvedas y redirige httpx al servidor en memoria."""
+    """Aísla BD, bóvedas y redirige httpx2 al servidor en memoria."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "test_contacts.db")
     database.init_db()
 
     api_client = TestClient(app)
-    monkeypatch.setattr(httpx, "post", api_client.post)
-    monkeypatch.setattr(httpx, "get", api_client.get)
+    monkeypatch.setattr(httpx2, "post", api_client.post)
+    monkeypatch.setattr(httpx2, "get", api_client.get)
 
 
 @pytest.fixture
@@ -193,7 +193,7 @@ def test_forged_first_packet_does_not_create_session_or_pin(alicia_bob):
     alicia, bob = alicia_bob
 
     # Un atacante deposita en el buzón de Bob un primer paquete falso "de alicia"
-    httpx.post("/messages", headers=alicia._auth_headers(), json={
+    httpx2.post("/messages", headers=alicia._auth_headers(), json={
         "recipient": "bob",
         "sender_ik_dh": b64e(generate_x25519_keypair()[1]),
         "ephemeral_pub": b64e(generate_x25519_keypair()[1]),
