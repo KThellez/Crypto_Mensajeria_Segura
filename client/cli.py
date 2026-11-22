@@ -1,27 +1,46 @@
+"""
+Módulo: client/cli.py
+Propósito: Cliente interactivo de consola con bóveda cifrada local, X3DH, Ratchet,
+           directorio de contactos [VERIFICADO / NO VERIFICADO], QR en consola e historial.
+"""
+
 import base64
 import getpass
+import hmac
 import os
+from datetime import datetime
+from typing import Dict, List, Optional
 
-from typing import Dict
-
-import httpx
+import httpx2
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives.asymmetric import x25519
 
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 
-from client.crypto_utils import(
+from client.crypto_utils import (
     compute_safety_number,
     generate_ed25519_keypair,
     generate_x25519_keypair,
+    identity_material,
     load_encrypted_vault,
     save_encrypted_vault,
     sign_prekey,
+    verify_prekey_signature,
 )
 from client.session import ChatSession, EncryptedPacket, PreKeyBundle
 
 SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:8000")
+# Certificado autofirmado del servidor (Docker/TLS). Si no se define, se usa la CA del sistema.
+SSL_CERT_FILE = os.getenv("SSL_CERT_FILE")
+
+QR_PREFIX = "E2EE-SN"
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 def b64e(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
@@ -30,13 +49,48 @@ def b64e(data: bytes) -> str:
 def b64d(text: str) -> bytes:
     return base64.b64decode(text.encode("ascii"))
 
+
 def priv_to_b64(priv_key) -> str:
     raw = priv_key.private_bytes(
-        encoding = serialization.Encoding.Raw,
-        format = serialization.PrivateFormat.Raw,
-        encryption_algorithm = serialization.NoEncryption(),
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
     )
     return b64e(raw)
+
+
+def _http_kwargs() -> dict:
+    """Opciones TLS para httpx2: confía en el certificado del servidor si se configuró."""
+    return {"verify": SSL_CERT_FILE} if SSL_CERT_FILE else {}
+
+
+def _now() -> str:
+    return datetime.now().strftime(TS_FORMAT)
+
+
+def build_qr_payload(user_a: str, user_b: str, safety_number: str) -> str:
+    """
+    Contenido del QR de verificación fuera de banda.
+    Los usuarios se ordenan para que ambos extremos generen exactamente el mismo QR.
+    """
+    first, second = sorted([user_a, user_b])
+    return f"{QR_PREFIX}:{first}:{second}:{safety_number.replace(' ', '')}"
+
+
+def print_qr_console(payload: str) -> None:
+    """Dibuja un código QR en la terminal para comparar el Safety Number en persona."""
+    if qrcode is None:
+        print("  (Instala 'qrcode' para visualizar el código QR en consola)")
+        return
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    try:
+        qr.print_ascii(invert=True)
+    except UnicodeEncodeError:
+        # Consolas sin UTF-8 no pueden pintar los bloques del QR
+        print("  (Tu consola no soporta UTF-8; compara el texto del QR manualmente)")
+    print(f"  Contenido QR: {payload}")
 
 
 class SecureClient:
@@ -46,10 +100,13 @@ class SecureClient:
         self.vault_path = f"{username}_vault.json"
         self.token: str = ""
         self.vault: Dict = {}
-        self.sessions: Dict[str, ChatSession] = {} 
-        
+        self.sessions: Dict[str, ChatSession] = {}
+
+    # ------------------------------------------------------------------
+    # Persistencia de la bóveda
+    # ------------------------------------------------------------------
     def _save_state(self) -> None:
-        """ Guarda claves privadas, contactos conocidos, 
+        """ Guarda claves privadas, contactos conocidos/verificados,
             estado del ratchet e historial cifrados
         """
         serialized_sessions = {}
@@ -64,9 +121,9 @@ class SecureClient:
             }
         self.vault["sessions"] = serialized_sessions
         save_encrypted_vault(self.vault_path, self.password, self.vault)
-        
+
     def _restore_sessions(self) -> None:
-        """ Reconstruye en memoria las sesiones 
+        """ Reconstruye en memoria las sesiones
             activas guardadas en la bóveda
         """
         for peer, data in self.vault.get("sessions", {}).items():
@@ -78,13 +135,37 @@ class SecureClient:
                 send_counter=data["send_counter"],
                 received_counters=set(data["received_counters"]),
             )
-                
+
+    def _ensure_vault_schema(self) -> None:
+        """Compatibilidad con bóvedas creadas con versiones anteriores del cliente."""
+        known = self.vault.setdefault("known_contacts", {})
+        verified = self.vault.setdefault("verified_contacts", [])
+        self.vault.setdefault("sessions", {})
+        self.vault.setdefault("history", [])
+
+        # Formato antiguo: {usuario: ik_dh_pub_b64}. Se migra a la identidad completa;
+        # la clave de firma se fija la próxima vez que se descargue el bundle del contacto.
+        # El Safety Number antiguo solo cubría IK_dh, así que la verificación previa ya no vale.
+        revoked = []
+        for peer, entry in list(known.items()):
+            if isinstance(entry, str):
+                known[peer] = {"ik_sig_pub": None, "ik_dh_pub": entry}
+                if peer in verified:
+                    verified.remove(peer)
+                    revoked.append(peer)
+        if revoked:
+            print("[AVISO] El Safety Number ahora incluye también la clave de firma (Ed25519).")
+            print(f"  Vuelve a verificar a: {', '.join('@' + p for p in revoked)}")
+
+    # ------------------------------------------------------------------
+    # Fases 1 y 2: registro y login
+    # ------------------------------------------------------------------
     def register(self) -> None:
         """ Fase 1
-                Genera identidades Ed25519/X25519, 
+                Genera identidades Ed25519/X25519,
                 firma SPK, registra y cifra bóveda
         """
-        
+
         if os.path.exists(self.vault_path):
             raise FileExistsError(f"Ya existe una bóveda local para '{self.username}'.")
 
@@ -102,7 +183,7 @@ class SecureClient:
             "spk_sig": b64e(spk_sig),
         }
 
-        res = httpx.post(f"{SERVER_URL}/register", json=payload)
+        res = httpx2.post(f"{SERVER_URL}/register", json=payload, **_http_kwargs())
         if res.status_code != 201:
             raise RuntimeError(f"Error al registrar en servidor: {res.text}")
 
@@ -115,7 +196,9 @@ class SecureClient:
                 "spk_priv": priv_to_b64(spk_priv),
                 "spk_pub": b64e(spk_pub),
             },
+            # {usuario: {"ik_sig_pub": b64, "ik_dh_pub": b64}}  (Identity Pinning / TOFU)
             "known_contacts": {},
+            "verified_contacts": [],  # Contactos verificados vía Safety Number / QR
             "sessions": {},
             "history": [],
         }
@@ -124,10 +207,10 @@ class SecureClient:
 
     def login(self) -> None:
         """ Fase 2
-                Descifra bóveda local y solicita token de sesión 
+                Descifra bóveda local y solicita token de sesión
                 de 256 bits al servidor
         """
-        
+
         try:
             self.vault = load_encrypted_vault(self.vault_path, self.password)
         except FileNotFoundError:
@@ -135,9 +218,12 @@ class SecureClient:
         except InvalidTag:
             raise ValueError("Contraseña local incorrecta: imposible descifrar la bóveda.")
 
-        res = httpx.post(
+        self._ensure_vault_schema()
+
+        res = httpx2.post(
             f"{SERVER_URL}/login",
             json={"username": self.username, "password": self.password},
+            **_http_kwargs(),
         )
         if res.status_code != 200:
             raise RuntimeError(f"Error de autenticación en servidor: {res.text}")
@@ -149,47 +235,190 @@ class SecureClient:
     def _auth_headers(self) -> dict:
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _check_identity_pinning(self, peer: str, peer_ik_dh_pub: bytes) -> None:
-        """ Fase 5 / STRIDE:
-                    Alerta si la clave de identidad de 
-                    un contacto conocido cambió
+    def _fetch_bundle(self, peer: str) -> Optional[PreKeyBundle]:
+        """Descarga el PreKey Bundle público de un usuario desde el directorio del servidor."""
+        res = httpx2.get(f"{SERVER_URL}/keys/{peer}", headers=self._auth_headers(), **_http_kwargs())
+        if res.status_code != 200:
+            print(f"[ERROR] No se pudo obtener el bundle de '{peer}': {res.text}")
+            return None
+        data = res.json()
+        return PreKeyBundle(
+            ik_sig_pub=b64d(data["ik_sig_pub"]),
+            ik_dh_pub=b64d(data["ik_dh_pub"]),
+            spk_pub=b64d(data["spk_pub"]),
+            spk_sig=b64d(data["spk_sig"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Fase 5: directorio de contactos y verificación
+    # ------------------------------------------------------------------
+    def _safety_number_with(self, peer_ik_sig_pub: bytes, peer_ik_dh_pub: bytes) -> str:
+        """Safety Number sobre la identidad completa (IK_sig || IK_dh) de ambos usuarios."""
+        keys = self.vault["keys"]
+        local_identity = identity_material(b64d(keys["ik_sig_pub"]), b64d(keys["ik_dh_pub"]))
+        return compute_safety_number(local_identity, identity_material(peer_ik_sig_pub, peer_ik_dh_pub))
+
+    def _check_identity_pinning(self, peer: str, peer_ik_sig_pub: bytes, peer_ik_dh_pub: bytes) -> None:
+        """ Fase 5 / STRIDE (Suplantación):
+                TOFU: fija la identidad completa (IK_sig + IK_dh) la primera vez que se ve.
+                Si después cambia cualquiera de las dos claves, alerta y revoca el estado VERIFICADO.
         """
-        
-        known = self.vault["known_contacts"].get(peer)
-        peer_ik_b64 = b64e(peer_ik_dh_pub)
-        local_ik_pub = b64d(self.vault["keys"]["ik_dh_pub"])
-        safety_num = compute_safety_number(local_ik_pub, peer_ik_dh_pub)
+        known_contacts = self.vault["known_contacts"]
+        known = known_contacts.get(peer)
+        new_identity = {"ik_sig_pub": b64e(peer_ik_sig_pub), "ik_dh_pub": b64e(peer_ik_dh_pub)}
+        safety_num = self._safety_number_with(peer_ik_sig_pub, peer_ik_dh_pub)
 
         if known is None:
-            self.vault["known_contacts"][peer] = peer_ik_b64
-            print(f"\n[NUEVO CONTACTO] Safety Number con {peer}:\n  {safety_num}\n")
-        elif known != peer_ik_b64:
-            print("\n" + "!" * 60)
-            print(f"ALERTA DE SEGURIDAD: La clave de identidad de '{peer}' CAMBIÓ.")
-            print("Posible ataque de suplantación (MITM). Contacto NO verificado.")
-            print(f"Nuevo Safety Number: {safety_num}")
-            print("!" * 60 + "\n")
+            known_contacts[peer] = new_identity
+            print(f"\n[NUEVO CONTACTO] @{peer} añadido al directorio como [NO VERIFICADO].")
+            print(f"  Safety Number: {safety_num}\n")
+            return
 
+        # Contacto migrado de una bóveda antigua: solo se conocía IK_dh. Si coincide,
+        # se completa la identidad con la clave de firma (TOFU sobre IK_sig).
+        if known["ik_sig_pub"] is None and known["ik_dh_pub"] == new_identity["ik_dh_pub"]:
+            known["ik_sig_pub"] = new_identity["ik_sig_pub"]
+            return
+
+        if known == new_identity:
+            return
+
+        changed = [
+            name for field, name in (("ik_sig_pub", "firma Ed25519"), ("ik_dh_pub", "acuerdo X25519"))
+            if known[field] != new_identity[field]
+        ]
+        known_contacts[peer] = new_identity
+        was_verified = peer in self.vault["verified_contacts"]
+        if was_verified:
+            self.vault["verified_contacts"].remove(peer)
+        print("\n" + "!" * 60)
+        print(f"ALERTA DE SEGURIDAD: La clave de identidad de '{peer}' CAMBIÓ ({', '.join(changed)}).")
+        print("Posible ataque de suplantación (MITM).")
+        if was_verified:
+            print("Se revocó su estado [VERIFICADO].")
+        print(f"Nuevo Safety Number: {safety_num}")
+        print("Vuelve a verificarlo en persona antes de confiar en este contacto.")
+        print("!" * 60 + "\n")
+
+    def _fetch_sender_identity(self, sender: str, sender_ik_dh: bytes) -> Optional[bytes]:
+        """
+        Lado receptor: el paquete solo trae IK_dh del emisor. Se descarga su bundle para
+        obtener IK_sig y se exige que sea coherente:
+            - el IK_dh del directorio coincide con el usado en el X3DH del paquete, y
+            - la SPK del bundle está firmada por ese IK_sig.
+        Devuelve IK_sig, o None si el servidor entrega una identidad incoherente.
+        """
+        bundle = self._fetch_bundle(sender)
+        if bundle is None:
+            return None
+        if not hmac.compare_digest(bundle.ik_dh_pub, sender_ik_dh):
+            print(f"\n[ALERTA DE SEGURIDAD] El directorio publica para @{sender} una clave X25519")
+            print("  distinta a la usada en su mensaje. Posible MITM: mensaje descartado.")
+            return None
+        if not verify_prekey_signature(bundle.ik_sig_pub, bundle.spk_pub, bundle.spk_sig):
+            print(f"\n[ALERTA DE SEGURIDAD] La firma de la Signed PreKey de @{sender} no es válida.")
+            print("  Posible MITM: mensaje descartado.")
+            return None
+        return bundle.ik_sig_pub
+
+    def is_verified(self, peer: str) -> bool:
+        return peer in self.vault.get("verified_contacts", [])
+
+    def badge(self, peer: str) -> str:
+        return "[VERIFICADO]" if self.is_verified(peer) else "[NO VERIFICADO]"
+
+    def set_verified(self, peer: str, verified: bool = True) -> None:
+        if peer not in self.vault["known_contacts"]:
+            raise ValueError(f"'{peer}' no está en tu directorio de contactos.")
+        vlist = self.vault["verified_contacts"]
+        if verified and peer not in vlist:
+            vlist.append(peer)
+        elif not verified and peer in vlist:
+            vlist.remove(peer)
+        self._save_state()
+
+    def list_contacts(self) -> List[dict]:
+        """Directorio local: usuario, estado de verificación y si hay sesión activa."""
+        return [
+            {
+                "peer": peer,
+                "verified": self.is_verified(peer),
+                "has_session": peer in self.sessions,
+            }
+            for peer in sorted(self.vault["known_contacts"])
+        ]
+
+    def add_contact(self, peer: str) -> bool:
+        """Descarga la identidad pública de un usuario y la fija en el directorio (TOFU)."""
+        if peer == self.username:
+            print("[INFO] No puedes añadirte a ti mismo como contacto.")
+            return False
+        known = self.vault["known_contacts"].get(peer)
+        if known is not None and known["ik_sig_pub"] is not None:
+            return True
+        # Contacto nuevo, o migrado sin clave de firma: se descarga y fija su identidad
+        bundle = self._fetch_bundle(peer)
+        if bundle is None:
+            return False
+        self._check_identity_pinning(peer, bundle.ik_sig_pub, bundle.ik_dh_pub)
+        self._save_state()
+        return True
+
+    def get_safety_number(self, peer: str) -> Optional[str]:
+        """Safety Number con un contacto del directorio (lo añade si es nuevo)."""
+        if not self.add_contact(peer):
+            return None
+        known = self.vault["known_contacts"][peer]
+        return self._safety_number_with(b64d(known["ik_sig_pub"]), b64d(known["ik_dh_pub"]))
+
+    def show_safety_number(self, peer: str) -> Optional[str]:
+        """ Fase 5
+                Muestra el Safety Number y su QR
+                para verificación fuera de banda
+        """
+        sn = self.get_safety_number(peer)
+        if sn is None:
+            return None
+        print(f"\nContacto      : @{peer} {self.badge(peer)}")
+        print(f"Safety Number : {sn}\n")
+        print_qr_console(build_qr_payload(self.username, peer, sn))
+        return sn
+
+    def verify_contact(self, peer: str, peer_code: str) -> bool:
+        """
+        Compara el Safety Number (o el contenido del QR) que muestra el contacto
+        con el calculado localmente. Si coinciden, lo marca como VERIFICADO.
+        """
+        sn = self.get_safety_number(peer)
+        if sn is None:
+            return False
+
+        code = peer_code.strip()
+        if code.upper().startswith(QR_PREFIX):
+            expected = build_qr_payload(self.username, peer, sn)
+        else:
+            code = code.replace(" ", "").upper()
+            expected = sn.replace(" ", "")
+
+        if hmac.compare_digest(code.encode(), expected.encode()):
+            self.set_verified(peer, True)
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Fases 3 y 4: mensajería
+    # ------------------------------------------------------------------
     def send_message(self, recipient: str, text: str) -> None:
-        """ Fases 3 y 4: 
-                    Establece X3DH si es necesario, 
+        """ Fases 3 y 4:
+                    Establece X3DH si es necesario,
                     avanza ratchet y envía cifrado
         """
-        
-        if recipient not in self.sessions:
-            res = httpx.get(f"{SERVER_URL}/keys/{recipient}", headers=self._auth_headers())
-            if res.status_code != 200:
-                print(f"[ERROR] No se pudo obtener el bundle de '{recipient}': {res.text}")
-                return
 
-            data = res.json()
-            bundle = PreKeyBundle(
-                ik_sig_pub=b64d(data["ik_sig_pub"]),
-                ik_dh_pub=b64d(data["ik_dh_pub"]),
-                spk_pub=b64d(data["spk_pub"]),
-                spk_sig=b64d(data["spk_sig"]),
-            )
-            self._check_identity_pinning(recipient, bundle.ik_dh_pub)
+        if recipient not in self.sessions:
+            bundle = self._fetch_bundle(recipient)
+            if bundle is None:
+                return
+            self._check_identity_pinning(recipient, bundle.ik_sig_pub, bundle.ik_dh_pub)
 
             local_ik_priv = x25519.X25519PrivateKey.from_private_bytes(
                 b64d(self.vault["keys"]["ik_dh_priv"])
@@ -210,28 +439,34 @@ class SecureClient:
             "ciphertext": b64e(packet.ciphertext),
         }
 
-        res = httpx.post(f"{SERVER_URL}/messages", json=payload, headers=self._auth_headers())
+        res = httpx2.post(
+            f"{SERVER_URL}/messages", json=payload, headers=self._auth_headers(), **_http_kwargs()
+        )
         if res.status_code == 201:
-            self.vault["history"].append({"dir": "OUT", "peer": recipient, "text": text})
+            self.vault["history"].append(
+                {"dir": "OUT", "peer": recipient, "text": text, "ts": _now()}
+            )
             self._save_state()
-            print(f"[ENVIADO a {recipient} | n={packet.counter}]")
+            print(f"[ENVIADO a @{recipient} {self.badge(recipient)} | n={packet.counter}]")
+            if not self.is_verified(recipient):
+                print("  Aviso: contacto sin verificar. Compara el Safety Number en el directorio [3].")
         else:
             print(f"[ERROR al enviar]: {res.text}")
-            
-    def check_inbox(self) -> None:
-        """ Descarga mensajes del buzón, 
+
+    def check_inbox(self) -> List[dict]:
+        """ Descarga mensajes del buzón,
             completa X3DH si es sesión nueva y descifra
         """
-        
-        res = httpx.get(f"{SERVER_URL}/messages", headers=self._auth_headers())
+
+        res = httpx2.get(f"{SERVER_URL}/messages", headers=self._auth_headers(), **_http_kwargs())
         if res.status_code != 200:
             print(f"[ERROR al consultar buzón]: {res.text}")
-            return
+            return []
 
         messages = res.json()
         if not messages:
             print("[BUZÓN] No hay mensajes nuevos.")
-            return
+            return []
 
         local_ik_priv = x25519.X25519PrivateKey.from_private_bytes(
             b64d(self.vault["keys"]["ik_dh_priv"])
@@ -241,16 +476,22 @@ class SecureClient:
             b64d(self.vault["keys"]["spk_priv"])
         )
 
+        received = []
         for msg in messages:
             sender = msg["sender"]
             sender_ik_dh = b64d(msg["sender_ik_dh"])
             ephemeral_pub = b64d(msg["ephemeral_pub"])
 
-            if sender not in self.sessions:
-                self._check_identity_pinning(sender, sender_ik_dh)
-                self.sessions[sender] = ChatSession.accept_x3dh(
+            # Sesion nueva: se crea de forma provisional y solo se guarda (junto con la
+            # identidad del contacto) si el primer mensaje descifra correctamente.
+            # Asi un paquete falso no deja una sesion inservible ni fija una clave falsa.
+            is_new_session = sender not in self.sessions
+            if is_new_session:
+                session = ChatSession.accept_x3dh(
                     local_ik_priv, local_ik_pub, local_spk_priv, sender_ik_dh, ephemeral_pub
                 )
+            else:
+                session = self.sessions[sender]
 
             packet = EncryptedPacket(
                 sender_ik_dh=sender_ik_dh,
@@ -260,29 +501,110 @@ class SecureClient:
                 ciphertext=b64d(msg["ciphertext"]),
             )
 
+            # Prueba: Intenta abrir el mensaje, si el paquete
+            # estaba alterado o es falso, no se guarda 
+            # la sesión ni la identidad del contacto.
             try:
-                plaintext = self.sessions[sender].decrypt_message(packet)
-                print(f"\n[{sender} | n={packet.counter}]: {plaintext}")
-                self.vault["history"].append({"dir": "IN", "peer": sender, "text": plaintext})
+                plaintext = session.decrypt_message(packet)
             except Exception as exc:
-                print(f"\n[RECHAZADO de {sender}]: {exc}")
+                reason = str(exc) or "etiqueta GCM inválida (paquete alterado o falso)"
+                print(f"\n[RECHAZADO de @{sender}]: {type(exc).__name__}: {reason}")
+                continue
+
+            # Si logro tener exito el primer mensaje, 
+            # fija la identidad del contacto y guarda la sesión
+            if is_new_session:
+                sender_ik_sig = self._fetch_sender_identity(sender, sender_ik_dh)
+                if sender_ik_sig is None:
+                    continue
+                self._check_identity_pinning(sender, sender_ik_sig, sender_ik_dh)
+                self.sessions[sender] = session
+
+            record = {"dir": "IN", "peer": sender, "text": plaintext, "ts": _now()}
+            self.vault["history"].append(record)
+            received.append(record)
+            print(f"\n[{record['ts']}] @{sender} {self.badge(sender)} | n={packet.counter}: {plaintext}")
 
         self._save_state()
-        
-    def show_safety_number(self, peer: str) -> None:
-        """ Fase 5
-                Muestra el Safety Number actual 
-                con un contacto para verificación manual
-        """
-        
-        peer_ik_b64 = self.vault["known_contacts"].get(peer)
-        if not peer_ik_b64:
-            print(f"[INFO] Aún no has intercambiado claves con '{peer}'.")
+        return received
+
+    def get_history(self, peer: str = "") -> List[dict]:
+        return [h for h in self.vault["history"] if not peer or h["peer"] == peer]
+
+
+# ----------------------------------------------------------------------
+# Interfaz de consola
+# ----------------------------------------------------------------------
+def _contacts_menu(client: SecureClient) -> None:
+    while True:
+        contacts = client.list_contacts()
+        print("\n--- DIRECTORIO DE CONTACTOS ---")
+        if not contacts:
+            print("(Aún no tienes contactos. Añade uno con la opción [a])")
+        for c in contacts:
+            status = "[VERIFICADO]   " if c["verified"] else "[NO VERIFICADO]"
+            session = "sesión activa" if c["has_session"] else "sin sesión"
+            print(f"  • @{c['peer']:<15} {status}  ({session})")
+
+        print("\n[a] Añadir contacto  [s] Safety Number + QR  [v] Verificar contacto")
+        print("[r] Quitar verificación  [Enter] Volver")
+        opt = input("> ").strip().lower()
+
+        if not opt:
             return
-        local_ik_pub = b64d(self.vault["keys"]["ik_dh_pub"])
-        sn = compute_safety_number(local_ik_pub, b64d(peer_ik_b64))
-        print(f"[SAFETY NUMBER con {peer}]: {sn}")
-        
+        if opt not in ("a", "s", "v", "r"):
+            print("Opción inválida.")
+            continue
+
+        peer = input("Usuario: ").strip()
+        if not peer:
+            continue
+
+        if opt == "a":
+            if client.add_contact(peer):
+                print(f"[OK] @{peer} está en tu directorio {client.badge(peer)}.")
+
+        elif opt == "s":
+            client.show_safety_number(peer)
+
+        elif opt == "v":
+            sn = client.show_safety_number(peer)
+            if sn is None:
+                continue
+            print("\nCompara este código con el que ve tu contacto en SU pantalla (en persona o")
+            print("por un canal de confianza). Pega aquí su Safety Number o el texto de su QR,")
+            print("o escribe 's' si ya los comparaste visualmente y coinciden.")
+            code = input("Código del contacto: ").strip()
+            if code.lower() == "s":
+                client.set_verified(peer, True)
+                print(f"[OK] @{peer} marcado como [VERIFICADO].")
+            elif client.verify_contact(peer, code):
+                print(f"[OK] Los códigos coinciden. @{peer} marcado como [VERIFICADO].")
+            else:
+                print("[ALERTA] Los códigos NO coinciden. Posible MITM: el contacto sigue [NO VERIFICADO].")
+
+        elif opt == "r":
+            try:
+                client.set_verified(peer, False)
+                print(f"[OK] @{peer} marcado como [NO VERIFICADO].")
+            except ValueError as exc:
+                print(f"[ERROR] {exc}")
+
+
+def _history_menu(client: SecureClient) -> None:
+    peer = input("Filtrar por usuario (Enter para ver todo): ").strip()
+    print("\n--- HISTORIAL LOCAL (bóveda cifrada) ---")
+    history = client.get_history(peer)
+    if not history:
+        print("(Sin mensajes registrados)")
+    for h in history:
+        ts = h.get("ts", "----------  --:--:--")  # Mensajes de bóvedas antiguas sin fecha
+        mark = "✓" if client.is_verified(h["peer"]) else "⚠"
+        if h["dir"] == "OUT":
+            print(f"[{ts}] Tú -> @{h['peer']} ({mark}): {h['text']}")
+        else:
+            print(f"[{ts}] @{h['peer']} ({mark}) -> Tú: {h['text']}")
+
 
 def main() -> None:
     print("=== Mensajería Segura E2EE (Protocolo Signal Simplificado) ===")
@@ -305,20 +627,33 @@ def main() -> None:
         return
 
     while True:
-        print("\nComandos: [1] Enviar mensaje  [2] Revisar buzón  [3] Ver Safety Number  [4] Salir")
+        print("\n--- MENÚ PRINCIPAL ---")
+        print("[1] Enviar mensaje cifrado")
+        print("[2] Revisar buzón")
+        print("[3] Directorio de contactos (Safety Number / QR / verificación)")
+        print("[4] Historial de conversaciones")
+        print("[5] Salir")
         cmd = input("> ").strip()
-        if cmd == "1":
-            dest = input("Destinatario: ").strip()
-            msg = input("Mensaje: ")
-            client.send_message(dest, msg)
-        elif cmd == "2":
-            client.check_inbox()
-        elif cmd == "3":
-            peer = input("Contacto: ").strip()
-            client.show_safety_number(peer)
-        elif cmd == "4":
-            break
+
+        try:
+            if cmd == "1":
+                dest = input("Destinatario: ").strip()
+                msg = input("Mensaje: ")
+                client.send_message(dest, msg)
+            elif cmd == "2":
+                client.check_inbox()
+            elif cmd == "3":
+                _contacts_menu(client)
+            elif cmd == "4":
+                _history_menu(client)
+            elif cmd == "5":
+                print("Bóveda cifrada guardada. Saliendo...")
+                break
+            else:
+                print("Opción inválida.")
+        except Exception as exc:
+            print(f"[ERROR] {exc}")
 
 
 if __name__ == "__main__":
-    main()   
+    main()
