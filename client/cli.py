@@ -623,23 +623,31 @@ def _history_menu(client: SecureClient) -> None:
 
 def main() -> None:
     print("=== Mensajería Segura E2EE (Protocolo Signal Simplificado) ===")
-    action = input("1) Registrarse  |  2) Iniciar sesión: ").strip()
-    username = input("Usuario: ").strip()
-    password = getpass.getpass("Contraseña: ")
+    client: Optional[SecureClient] = None
 
-    client = SecureClient(username, password)
-    try:
-        if action == "1":
-            client.register()
-            client.login()
-        elif action == "2":
-            client.login()
-        else:
-            print("Opción inválida.")
+    while client is None:
+        action = input("\n1) Registrarse  |  2) Iniciar sesión  |  3) Salir: ").strip()
+        if action == "3":
+            print("Saliendo...")
             return
-    except Exception as exc:
-        print(f"[FALLO]: {exc}")
-        return
+        if action not in ("1", "2"):
+            print("[ERROR] Opción inválida. Elige 1, 2 o 3.")
+            continue
+
+        username = input("Usuario: ").strip()
+        password = getpass.getpass("Contraseña: ")
+        if not username or not password:
+            print("[ERROR] Usuario y contraseña no pueden estar vacíos.")
+            continue
+
+        candidate = SecureClient(username, password)
+        try:
+            if action == "1":
+                candidate.register()
+            candidate.login()
+            client = candidate
+        except Exception as exc:
+            print(f"[FALLO]: {exc}. Intenta nuevamente.")
 
     while True:
         print("\n--- MENÚ PRINCIPAL ---")
