@@ -28,6 +28,11 @@ from client.crypto_utils import (
 
 HKDF_INFO_X3DH = b"UDFJC_Crypto_X3DH_RootKey_v1"
 
+
+HKDF_INFO_CHAIN_INIT_TO_RESP = b"UDFJC_Crypto_Chain_InitToResp_v1"
+HKDF_INFO_CHAIN_RESP_TO_INIT = b"UDFJC_Crypto_Chain_RespToInit_v1"
+
+
 # Maximo de mensajes perdidos que el receptor acepta saltar en un solo paso
 # (mismo concepto que MAX_SKIP en la especificacion del Double Ratchet de Signal)
 MAX_SKIP = 1000
@@ -43,6 +48,7 @@ class PreKeyBundle:
     ik_dh_pub: bytes    # Clave publica X25519 (32B), para el intercambio Diffie-Hellman (identidad a largo plazo)
     spk_pub: bytes      # Signed PreKey X25519 (32B), para el intercambio Diffie-Hellman (firmada por ik_sig_priv)
     spk_sig: bytes      # Firma Ed25519 (64B) permite probar que spk_pub pertenece al dueño (ik_sig_pub), evitando MITM
+    
 
 @dataclass
 class EncryptedPacket:
@@ -66,9 +72,11 @@ class ChatSession:
     """
     local_ik_dh_pub: bytes
     peer_ik_dh_pub: bytes
-    chain_key: bytes
+    send_chain_key: bytes
+    recv_chain_key: bytes
     ephemeral_pub: bytes
     send_counter: int = 0
+    recv_counter: int = 0
     received_counters: Set[int] = field(default_factory=set)
     
     
@@ -111,8 +119,11 @@ class ChatSession:
         dh3 = compute_dh(ek_priv, peer_bundle.spk_pub)            
         
         
-        # Derivar la claver raiz RK con HKDF-SHA256
+        # Derivar la claver raiz RK con HKDF-SHA256 y bifurcar cadenas direccionales
         root_key = derive_hkdf(dh1 + dh2 + dh3, info=HKDF_INFO_X3DH)
+        
+        send_ck = derive_hkdf(root_key, info=HKDF_INFO_CHAIN_INIT_TO_RESP)
+        recv_ck = derive_hkdf(root_key, info=HKDF_INFO_CHAIN_RESP_TO_INIT)
         
         
         # ek_priv, dh1, dh2, dh3
@@ -120,10 +131,11 @@ class ChatSession:
         del ek_priv, dh1, dh2, dh3
         
         return cls(
-            local_ik_dh_pub = local_ik_dh_pub,
-            peer_ik_dh_pub = peer_bundle.ik_dh_pub,
-            chain_key = root_key,
-            ephemeral_pub = ek_pub,
+            local_ik_dh_pub=local_ik_dh_pub,
+            peer_ik_dh_pub=peer_bundle.ik_dh_pub,
+            send_chain_key=send_ck,
+            recv_chain_key=recv_ck,
+            ephemeral_pub=ek_pub,
         )
         
         
@@ -146,15 +158,20 @@ class ChatSession:
         dh3 = compute_dh(local_spk_priv, sender_ephemeral_pub)
         
         root_key = derive_hkdf(dh1 + dh2 + dh3, info=HKDF_INFO_X3DH)
-        
+        # El receptor invierte el orden respecto al iniciador
+        recv_ck = derive_hkdf(root_key, info=HKDF_INFO_CHAIN_INIT_TO_RESP)
+        send_ck = derive_hkdf(root_key, info=HKDF_INFO_CHAIN_RESP_TO_INIT)
          # dh1, dh2, dh3
                 # quedan fuera de alcance al ser capturados de memoria
+        del dh1, dh2, dh3, root_key
+        
                 
         return cls(
-            local_ik_dh_pub = local_ik_dh_pub,
-            peer_ik_dh_pub = sender_ik_dh_pub,
-            chain_key = root_key,
-            ephemeral_pub = sender_ephemeral_pub,
+            local_ik_dh_pub=local_ik_dh_pub,
+            peer_ik_dh_pub=sender_ik_dh_pub,
+            send_chain_key=send_ck,
+            recv_chain_key=recv_ck,
+            ephemeral_pub=sender_ephemeral_pub,
         )
         
     def _build_associated_data(
@@ -188,7 +205,7 @@ class ChatSession:
             deriva MK_n, reemplaza CK_n por CK_{n+1} y devuelve (MK_n, n).
             CK_n se sobrescribe, por lo que no se puede volver atrás.
         """
-        msg_key, self.chain_key = self._kdf_chain(self.chain_key)
+        msg_key, self.send_chain_key = self._kdf_chain(self.send_chain_key)
         return msg_key, self.send_counter
     
     def encrypt_message(self, plaintext: str) -> EncryptedPacket:
@@ -231,22 +248,22 @@ class ChatSession:
         """
         
         # Mitigacion Stride (Manipulacion / Replay): rechazar contadores repetidos o pasados
-        if packet.counter in self.received_counters or packet.counter < self.send_counter:
+        if packet.counter in self.received_counters or packet.counter < self.recv_counter:
             raise ValueError(f"ALERTA DE SEGURIDAD: Mensaje repetido o fuera de orden (n={packet.counter})")
 
         # Mitigacion (Denegacion de servicio): un contador enorme obligaria a calcular
         # millones de HMAC. Se limita cuantos mensajes perdidos se pueden saltar.
-        skipped = packet.counter - self.send_counter
+        skipped = packet.counter - self.recv_counter
         if skipped > MAX_SKIP:
             raise ValueError(
                 f"ALERTA DE SEGURIDAD: Contador demasiado adelantado (n={packet.counter}, "
-                f"esperado <= {self.send_counter + MAX_SKIP})"
+                f"esperado <= {self.recv_counter + MAX_SKIP})"
             )
 
         # El ratchet se avanza sobre una COPIA local de la cadena. El estado de la sesion
         # solo se modifica si la etiqueta GCM es valida: asi un paquete falso con un
         # contador alto no puede desincronizar la sesion (ver test_forged_packet_*).
-        chain_key = self.chain_key
+        chain_key = self.recv_chain_key
         for _ in range(skipped):        # Mensajes previos perdidos en la red
             _, chain_key = self._kdf_chain(chain_key)
         msg_key, next_chain_key = self._kdf_chain(chain_key)
@@ -261,7 +278,7 @@ class ChatSession:
             del msg_key
 
         # Descifrado autentico: ahora si se confirma el avance del ratchet
-        self.chain_key = next_chain_key
-        self.send_counter = packet.counter + 1
+        self.recv_chain_key = next_chain_key
+        self.recv_counter = packet.counter + 1
         self.received_counters.add(packet.counter)
         return plaintext_bytes.decode("utf-8")
