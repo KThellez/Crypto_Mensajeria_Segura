@@ -1,3 +1,14 @@
+"""
+Módulo: server/main.py
+Propósito: API REST en FastAPI que opera como directorio de claves públicas y buzón cifrado.
+
+Principio arquitectónico (Zero-Knowledge / Servidor Ciego):
+    - Este módulo NO importa client/crypto_utils.py ni client/session.py.
+    - Nunca recibe contraseñas en claro en BD (usa Argon2id) ni claves privadas.
+    - Los tokens de sesión de 256 bits se almacenan únicamente como su hash SHA-256.
+    - Cada usuario solo puede leer y vaciar su propio buzón (mitiga Elevation of Privilege).
+"""
+
 import hashlib
 import secrets
 import sqlite3
@@ -66,7 +77,11 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def get_current_user(authorization: str = Header(...)) -> str:
-    """Valida el token Bearer, comprueba expiración y retorna el username dueño."""
+    """
+    Dependencia de seguridad Bearer.
+    Verifica que el token exista en BD (comparando su SHA-256) y no haya expirado.
+    Devuelve el username autenticado para aislar los buzones por propietario.
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

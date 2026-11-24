@@ -1,4 +1,4 @@
-import httpx
+import httpx2
 import pytest
 
 from fastapi.testclient import TestClient
@@ -11,7 +11,7 @@ from server.main import app
 @pytest.fixture(autouse=True)
 def isolated_env(tmp_path, monkeypatch):
     """ Aisla la base de datos SQLite, 
-        las bovedas JSON y redirige httpx al servidor en memoria
+        las bovedas JSON y redirige httpx2 al servidor en memoria
     """
     
     monkeypatch.chdir(tmp_path)
@@ -20,8 +20,8 @@ def isolated_env(tmp_path, monkeypatch):
     database.init_db()
 
     api_client = TestClient(app)
-    monkeypatch.setattr(httpx, "post", api_client.post)
-    monkeypatch.setattr(httpx, "get", api_client.get)
+    monkeypatch.setattr(httpx2, "post", api_client.post)
+    monkeypatch.setattr(httpx2, "get", api_client.get)
 
 
 def test_full_end_to_end_chat(capsys):

@@ -1,10 +1,14 @@
+import os
+
 import pytest
+from cryptography.exceptions import InvalidTag
+
 from client.crypto_utils import (
     generate_ed25519_keypair,
     generate_x25519_keypair,
     sign_prekey,
 )
-from client.session import ChatSession, PreKeyBundle
+from client.session import MAX_SKIP, ChatSession, EncryptedPacket, PreKeyBundle
 
 
 def _setup_users():
@@ -69,3 +73,77 @@ def test_replay_attack_rejected():
     # Un atacante captura pkt0 y lo reenvía por segunda vez
     with pytest.raises(ValueError, match="Mensaje repetido"):
         bob_session.decrypt_message(pkt0)
+
+
+def _open_session():
+    """Alicia inicia sesión, envía pkt0 y Bob lo descifra."""
+    (alice_priv, alice_pub), (bob_priv, bob_pub, bob_spk_priv, bob_bundle) = _setup_users()
+    alice = ChatSession.initiate_x3dh(alice_priv, alice_pub, bob_bundle)
+    pkt0 = alice.encrypt_message("hola 0")
+    bob = ChatSession.accept_x3dh(bob_priv, bob_pub, bob_spk_priv, pkt0.sender_ik_dh, pkt0.ephemeral_pub)
+    assert bob.decrypt_message(pkt0) == "hola 0"
+    return alice, bob, pkt0
+
+
+def _forged(pkt: EncryptedPacket, counter: int) -> EncryptedPacket:
+    """Paquete inyectado por un atacante de red: contador elegido y contenido aleatorio."""
+    return EncryptedPacket(pkt.sender_ik_dh, pkt.ephemeral_pub, counter, os.urandom(12), os.urandom(40))
+
+
+def test_tampered_ciphertext_rejected():
+    alice, bob, _ = _open_session()
+    pkt = alice.encrypt_message("Pagar 50 a Bob")
+    tampered = EncryptedPacket(
+        pkt.sender_ik_dh, pkt.ephemeral_pub, pkt.counter, pkt.nonce,
+        pkt.ciphertext[:-1] + bytes([pkt.ciphertext[-1] ^ 0x01]),
+    )
+    with pytest.raises(InvalidTag):
+        bob.decrypt_message(tampered)
+    # El original sigue siendo aceptado: el intento fallido no alteró la sesión
+    assert bob.decrypt_message(pkt) == "Pagar 50 a Bob"
+
+
+def test_forged_packet_does_not_desync_session():
+    alice, bob, pkt0 = _open_session()
+    state_before = (bob.recv_chain_key, bob.recv_counter, set(bob.received_counters))
+
+    with pytest.raises(InvalidTag):
+        bob.decrypt_message(_forged(pkt0, counter=5))
+
+    assert (bob.recv_chain_key, bob.recv_counter, bob.received_counters) == state_before
+    assert bob.decrypt_message(alice.encrypt_message("hola 1")) == "hola 1"
+
+
+def test_counter_beyond_max_skip_rejected_without_work():
+    alice, bob, pkt0 = _open_session()
+    chain_before = bob.recv_chain_key
+
+    with pytest.raises(ValueError, match="demasiado adelantado"):
+        bob.decrypt_message(_forged(pkt0, counter=10**9))
+
+    assert bob.recv_chain_key == chain_before
+    assert bob.decrypt_message(alice.encrypt_message("sigo vivo")) == "sigo vivo"
+
+
+def test_lost_messages_are_skipped_up_to_max_skip():
+    alice, bob, _ = _open_session()
+    for _ in range(3):
+        alice.encrypt_message("perdido en la red")
+    assert bob.decrypt_message(alice.encrypt_message("llega")) == "llega"
+
+    for _ in range(MAX_SKIP):
+        alice.encrypt_message("perdido")
+    assert bob.decrypt_message(alice.encrypt_message("en el límite")) == "en el límite"
+
+def test_simultaneous_bidirectional_messages():
+    alice, bob, _ = _open_session()
+    # Ambos envían al mismo tiempo sin esperar turno
+    pkt_a1 = alice.encrypt_message("Mensaje simultaneo A1")
+    pkt_a2 = alice.encrypt_message("Mensaje simultaneo A2")
+    pkt_b1 = bob.encrypt_message("Respuesta simultanea B1")
+    pkt_b2 = bob.encrypt_message("Respuesta simultanea B2")
+
+    assert bob.decrypt_message(pkt_a1) == "Mensaje simultaneo A1"
+    assert bob.decrypt_message(pkt_a2) == "Mensaje simultaneo A2"
+    assert alice.decrypt_message(pkt_b1) == "Respuesta simultanea B1"
+    assert alice.decrypt_message(pkt_b2) == "Respuesta simultanea B2"
