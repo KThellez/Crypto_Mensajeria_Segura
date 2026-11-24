@@ -182,3 +182,67 @@ if __name__ == "__main__":
     attack_3_replay_message()
     attack_4_and_5_server_dump_and_privilege_escalation()
     print("\nRESUMEN: Todas las defensas STRIDE verificadas con éxito")
+    
+    
+
+def attack_6_forged_packet_injection() -> None:
+    banner("TAMPERING / DoS: Inyeccion de paquete falso con contador adelantado")
+    alice_priv, alice_pub = generate_x25519_keypair()
+    bob_sig_priv, bob_sig_pub = generate_ed25519_keypair()
+    bob_priv, bob_pub = generate_x25519_keypair()
+    bob_spk_priv, bob_spk_pub = generate_x25519_keypair()
+
+    bundle = PreKeyBundle(
+        bob_sig_pub, bob_pub, bob_spk_pub, sign_prekey(bob_sig_priv, bob_spk_pub)
+    )
+    alice_sess = ChatSession.initiate_x3dh(alice_priv, alice_pub, bundle)
+    pkt0 = alice_sess.encrypt_message("Inicio legitimo")
+
+    bob_sess = ChatSession.accept_x3dh(
+        bob_priv, bob_pub, bob_spk_priv, pkt0.sender_ik_dh, pkt0.ephemeral_pub
+    )
+    bob_sess.decrypt_message(pkt0)
+
+    # Atacante inyecta un paquete falso con contador n=25 intentando desincronizar el ratchet
+    import os
+    forged_pkt = EncryptedPacket(
+        pkt0.sender_ik_dh, pkt0.ephemeral_pub, 25, os.urandom(12), os.urandom(48)
+    )
+    try:
+        bob_sess.decrypt_message(forged_pkt)
+        print("FALLO: Se acepto paquete inyectado")
+    except InvalidTag:
+        print("MITIGADO: Paquete falso rechazado sin alterar el estado de la sesion")
+
+    # El siguiente mensaje legitimo de Alicia (n=1) sigue descifrandose sin problema
+    pkt1 = alice_sess.encrypt_message("La sesion sigue intacta")
+    assert bob_sess.decrypt_message(pkt1) == "La sesion sigue intacta"
+    print("VERIFICADO: Bob descifro el mensaje legitimo posterior (n=1)")
+
+
+def attack_7_signing_key_substitution() -> None:
+    banner("SPOOFING: Servidor sustituye IK_sig de Bob y firma una SPK falsa")
+    from client.crypto_utils import compute_safety_number, identity_material
+
+    _, alice_ik_dh = generate_x25519_keypair()
+    alice_sig_priv, alice_sig_pub = generate_ed25519_keypair()
+
+    bob_sig_priv, bob_sig_pub = generate_ed25519_keypair()
+    _, bob_ik_dh = generate_x25519_keypair()
+
+    # Servidor malicioso genera su propia clave de firma Ed25519 para suplantar a Bob
+    _, attacker_sig_pub = generate_ed25519_keypair()
+
+    sn_real = compute_safety_number(
+        identity_material(alice_sig_pub, alice_ik_dh),
+        identity_material(bob_sig_pub, bob_ik_dh),
+    )
+    sn_mitm = compute_safety_number(
+        identity_material(alice_sig_pub, alice_ik_dh),
+        identity_material(attacker_sig_pub, bob_ik_dh),
+    )
+
+    assert sn_real != sn_mitm
+    print(f"Safety Number real : {sn_real}")
+    print(f"Safety Number MITM : {sn_mitm}")
+    print("MITIGADO: Al cubrir IK_sig || IK_dh, el Safety Number cambia y delata el MITM")
