@@ -175,16 +175,6 @@ def attack_4_and_5_server_dump_and_privilege_escalation() -> None:
             ).json()
             print(f"MITIGADO, Eva consulta /messages con su token y obtiene: {eva_inbox} (0 mensajes de Bob)")
 
-
-if __name__ == "__main__":
-    attack_1_spoofing_mitm_prekey()
-    attack_2_tampering_ciphertext()
-    attack_3_replay_message()
-    attack_4_and_5_server_dump_and_privilege_escalation()
-    print("\nRESUMEN: Todas las defensas STRIDE verificadas con éxito")
-    
-    
-
 def attack_6_forged_packet_injection() -> None:
     banner("TAMPERING / DoS: Inyeccion de paquete falso con contador adelantado")
     alice_priv, alice_pub = generate_x25519_keypair()
@@ -246,3 +236,13 @@ def attack_7_signing_key_substitution() -> None:
     print(f"Safety Number real : {sn_real}")
     print(f"Safety Number MITM : {sn_mitm}")
     print("MITIGADO: Al cubrir IK_sig || IK_dh, el Safety Number cambia y delata el MITM")
+
+if __name__ == "__main__":
+    attack_1_spoofing_mitm_prekey()
+    attack_2_tampering_ciphertext()
+    attack_3_replay_message()
+    attack_4_and_5_server_dump_and_privilege_escalation()
+    attack_6_forged_packet_injection()
+    attack_7_signing_key_substitution()
+    print("\nRESUMEN: Todas las defensas STRIDE verificadas con éxito")
+    
