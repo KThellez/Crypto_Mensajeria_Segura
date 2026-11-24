@@ -105,23 +105,23 @@ def test_tampered_ciphertext_rejected():
 
 def test_forged_packet_does_not_desync_session():
     alice, bob, pkt0 = _open_session()
-    state_before = (bob.chain_key, bob.send_counter, set(bob.received_counters))
+    state_before = (bob.recv_chain_key, bob.recv_counter, set(bob.received_counters))
 
     with pytest.raises(InvalidTag):
         bob.decrypt_message(_forged(pkt0, counter=5))
 
-    assert (bob.chain_key, bob.send_counter, bob.received_counters) == state_before
+    assert (bob.recv_chain_key, bob.recv_counter, bob.received_counters) == state_before
     assert bob.decrypt_message(alice.encrypt_message("hola 1")) == "hola 1"
 
 
 def test_counter_beyond_max_skip_rejected_without_work():
     alice, bob, pkt0 = _open_session()
-    chain_before = bob.chain_key
+    chain_before = bob.recv_chain_key
 
     with pytest.raises(ValueError, match="demasiado adelantado"):
         bob.decrypt_message(_forged(pkt0, counter=10**9))
 
-    assert bob.chain_key == chain_before
+    assert bob.recv_chain_key == chain_before
     assert bob.decrypt_message(alice.encrypt_message("sigo vivo")) == "sigo vivo"
 
 
@@ -134,3 +134,16 @@ def test_lost_messages_are_skipped_up_to_max_skip():
     for _ in range(MAX_SKIP):
         alice.encrypt_message("perdido")
     assert bob.decrypt_message(alice.encrypt_message("en el límite")) == "en el límite"
+
+def test_simultaneous_bidirectional_messages():
+    alice, bob, _ = _open_session()
+    # Ambos envían al mismo tiempo sin esperar turno
+    pkt_a1 = alice.encrypt_message("Mensaje simultaneo A1")
+    pkt_a2 = alice.encrypt_message("Mensaje simultaneo A2")
+    pkt_b1 = bob.encrypt_message("Respuesta simultanea B1")
+    pkt_b2 = bob.encrypt_message("Respuesta simultanea B2")
+
+    assert bob.decrypt_message(pkt_a1) == "Mensaje simultaneo A1"
+    assert bob.decrypt_message(pkt_a2) == "Mensaje simultaneo A2"
+    assert alice.decrypt_message(pkt_b1) == "Respuesta simultanea B1"
+    assert alice.decrypt_message(pkt_b2) == "Respuesta simultanea B2"

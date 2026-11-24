@@ -114,9 +114,11 @@ class SecureClient:
             serialized_sessions[peer] = {
                 "local_ik_dh_pub": b64e(sess.local_ik_dh_pub),
                 "peer_ik_dh_pub": b64e(sess.peer_ik_dh_pub),
-                "chain_key": b64e(sess.chain_key),
+                "send_chain_key": b64e(sess.send_chain_key),
+                "recv_chain_key": b64e(sess.recv_chain_key),
                 "ephemeral_pub": b64e(sess.ephemeral_pub),
                 "send_counter": sess.send_counter,
+                "recv_counter": sess.recv_counter,
                 "received_counters": list(sess.received_counters),
             }
         self.vault["sessions"] = serialized_sessions
@@ -130,9 +132,11 @@ class SecureClient:
             self.sessions[peer] = ChatSession(
                 local_ik_dh_pub=b64d(data["local_ik_dh_pub"]),
                 peer_ik_dh_pub=b64d(data["peer_ik_dh_pub"]),
-                chain_key=b64d(data["chain_key"]),
+                send_chain_key=b64d(data["send_chain_key"]),
+                recv_chain_key=b64d(data["recv_chain_key"]),
                 ephemeral_pub=b64d(data["ephemeral_pub"]),
                 send_counter=data["send_counter"],
+                recv_counter=data["recv_counter"],
                 received_counters=set(data["received_counters"]),
             )
 
@@ -413,7 +417,9 @@ class SecureClient:
                     Establece X3DH si es necesario,
                     avanza ratchet y envía cifrado
         """
-
+        if recipient not in self.sessions:
+            self.check_inbox()
+            
         if recipient not in self.sessions:
             bundle = self._fetch_bundle(recipient)
             if bundle is None:
@@ -492,7 +498,16 @@ class SecureClient:
                 )
             else:
                 session = self.sessions[sender]
-
+                # Desempate si ambos iniciaron X3DH simultáneamente (cada uno con su propia EK)
+                if ephemeral_pub != session.ephemeral_pub and msg["counter"] == 0:
+                    if sender_ik_dh < local_ik_pub:
+                        session = ChatSession.accept_x3dh(
+                            local_ik_priv, local_ik_pub, local_spk_priv, sender_ik_dh, ephemeral_pub
+                        )
+                        is_new_session = True
+                    else:
+                        continue
+                    
             packet = EncryptedPacket(
                 sender_ik_dh=sender_ik_dh,
                 ephemeral_pub=ephemeral_pub,
@@ -608,23 +623,31 @@ def _history_menu(client: SecureClient) -> None:
 
 def main() -> None:
     print("=== Mensajería Segura E2EE (Protocolo Signal Simplificado) ===")
-    action = input("1) Registrarse  |  2) Iniciar sesión: ").strip()
-    username = input("Usuario: ").strip()
-    password = getpass.getpass("Contraseña: ")
+    client: Optional[SecureClient] = None
 
-    client = SecureClient(username, password)
-    try:
-        if action == "1":
-            client.register()
-            client.login()
-        elif action == "2":
-            client.login()
-        else:
-            print("Opción inválida.")
+    while client is None:
+        action = input("\n1) Registrarse  |  2) Iniciar sesión  |  3) Salir: ").strip()
+        if action == "3":
+            print("Saliendo...")
             return
-    except Exception as exc:
-        print(f"[FALLO]: {exc}")
-        return
+        if action not in ("1", "2"):
+            print("[ERROR] Opción inválida. Elige 1, 2 o 3.")
+            continue
+
+        username = input("Usuario: ").strip()
+        password = getpass.getpass("Contraseña: ")
+        if not username or not password:
+            print("[ERROR] Usuario y contraseña no pueden estar vacíos.")
+            continue
+
+        candidate = SecureClient(username, password)
+        try:
+            if action == "1":
+                candidate.register()
+            candidate.login()
+            client = candidate
+        except Exception as exc:
+            print(f"[FALLO]: {exc}. Intenta nuevamente.")
 
     while True:
         print("\n--- MENÚ PRINCIPAL ---")
