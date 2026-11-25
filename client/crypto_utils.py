@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from hmac import compare_digest
 
 # GENERACION Y SERIALIZACION DE CLAVES ASIMETRICAS
 def generate_ed25519_keypair() -> Tuple[ed25519 .Ed25519PrivateKey, bytes]:
@@ -268,7 +269,7 @@ def decrypt_file_envelope(payload_text: str, output_dir: str) -> dict:
         del dek
 
     actual_hash = hashlib.sha256(raw_data).hexdigest()
-    if not hmac.compare_digest(actual_hash, envelope["sha256"]):
+    if not compare_digest(actual_hash, envelope["sha256"]):
         raise ValueError("ALERTA DE INTEGRIDAD: El SHA-256 del archivo descifrado no coincide.")
 
     os.makedirs(output_dir, exist_ok=True)
