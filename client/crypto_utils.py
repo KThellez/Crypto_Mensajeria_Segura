@@ -207,3 +207,78 @@ def load_encrypted_vault(filepath: str, password: str) -> dict:
     return json.loads(plaintext.decode("utf-8"))
     
     
+    
+    
+# Cifrado de sobre para archivos con (Envelope encryption)
+
+FILE_ENVELOPE_PREFIX = "__E2EE_FILE__:"
+
+
+def encrypt_file_envelope(filepath: str) -> str:
+    """
+    Implementa Envelope Encryption para un archivo local:
+      1. Genera una DEK (Data Encryption Key) aleatoria de 256 bits.
+      2. Calcula el SHA-256 del archivo en claro para verificación E2E.
+      3. Cifra el contenido binario con AES-256-GCM usando el nombre como AD.
+      4. Empaqueta la DEK y el criptograma en un sobre JSON listo para el Ratchet.
+    """
+    filename = os.path.basename(filepath)
+    with open(filepath, "rb") as f:
+        raw_data = f.read()
+
+    file_hash = hashlib.sha256(raw_data).hexdigest()
+    dek = os.urandom(32)  # Clave de datos de un solo uso (256 bits)
+    nonce, ciphertext = encrypt_aes_gcm(
+        dek, raw_data, associated_data=filename.encode("utf-8")
+    )
+
+    envelope = {
+        "filename": filename,
+        "size": len(raw_data),
+        "sha256": file_hash,
+        "dek": base64.b64encode(dek).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+    }
+    del dek
+    return FILE_ENVELOPE_PREFIX + json.dumps(envelope)
+
+
+def decrypt_file_envelope(payload_text: str, output_dir: str) -> dict:
+    """
+    Abre un sobre de archivo recibido por el Ratchet, descifra el binario con la DEK,
+    verifica la integridad SHA-256 y lo guarda sanitizando la ruta (anti Path Traversal).
+    """
+    if not payload_text.startswith(FILE_ENVELOPE_PREFIX):
+        raise ValueError("El mensaje no contiene un sobre de archivo válido.")
+
+    envelope = json.loads(payload_text[len(FILE_ENVELOPE_PREFIX):])
+    # Sanitiza el nombre para evitar ataques de Path Traversal (ej. ../../archivo)
+    safe_name = os.path.basename(envelope["filename"]) or "archivo_recibido.bin"
+
+    dek = base64.b64decode(envelope["dek"])
+    nonce = base64.b64decode(envelope["nonce"])
+    ciphertext = base64.b64decode(envelope["ciphertext"])
+
+    try:
+        raw_data = decrypt_aes_gcm(
+            dek, nonce, ciphertext, associated_data=safe_name.encode("utf-8")
+        )
+    finally:
+        del dek
+
+    actual_hash = hashlib.sha256(raw_data).hexdigest()
+    if not hmac.compare_digest(actual_hash, envelope["sha256"]):
+        raise ValueError("ALERTA DE INTEGRIDAD: El SHA-256 del archivo descifrado no coincide.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    saved_path = os.path.join(output_dir, safe_name)
+    with open(saved_path, "wb") as f:
+        f.write(raw_data)
+
+    return {
+        "filename": safe_name,
+        "size": len(raw_data),
+        "sha256": actual_hash,
+        "saved_path": saved_path,
+    }
