@@ -31,6 +31,9 @@ from client.crypto_utils import (
     save_encrypted_vault,
     sign_prekey,
     verify_prekey_signature,
+    FILE_ENVELOPE_PREFIX,
+    decrypt_file_envelope,
+    encrypt_file_envelope
 )
 from client.session import ChatSession, EncryptedPacket, PreKeyBundle
 
@@ -254,7 +257,7 @@ class SecureClient:
         )
 
     # ------------------------------------------------------------------
-    # Fase 5: directorio de contactos y verificación
+    # Directorio de contactos y verificación
     # ------------------------------------------------------------------
     def _safety_number_with(self, peer_ik_sig_pub: bytes, peer_ik_dh_pub: bytes) -> str:
         """Safety Number sobre la identidad completa (IK_sig || IK_dh) de ambos usuarios."""
@@ -410,7 +413,7 @@ class SecureClient:
         return False
 
     # ------------------------------------------------------------------
-    # Fases 3 y 4: mensajería
+    # mensajería envio y recepcion de mensajes
     # ------------------------------------------------------------------
     def send_message(self, recipient: str, text: str) -> None:
         """ Fases 3 y 4:
@@ -507,6 +510,7 @@ class SecureClient:
                         is_new_session = True
                     else:
                         continue
+            
                     
             packet = EncryptedPacket(
                 sender_ik_dh=sender_ik_dh,
@@ -534,17 +538,35 @@ class SecureClient:
                     continue
                 self._check_identity_pinning(sender, sender_ik_sig, sender_ik_dh)
                 self.sessions[sender] = session
+                
+            display_text = plaintext
+            if plaintext.startswith(FILE_ENVELOPE_PREFIX):
+                info = decrypt_file_envelope(plaintext, output_dir=f"downloads_{self.username}")
+                display_text = (
+                    f"[ARCHIVO ADJUNTO] '{info['filename']}' ({info['size']} bytes) "
+                    f"guardado en '{info['saved_path']}' | SHA-256: {info['sha256'][:16]}..."
+                )
 
-            record = {"dir": "IN", "peer": sender, "text": plaintext, "ts": _now()}
+            record = {"dir": "IN", "peer": sender, "text": display_text, "ts": _now()}
             self.vault["history"].append(record)
             received.append(record)
-            print(f"\n[{record['ts']}] @{sender} {self.badge(sender)} | n={packet.counter}: {plaintext}")
+            print(f"\n[{record['ts']}] @{sender} {self.badge(sender)} | n={packet.counter}: {display_text}")
 
         self._save_state()
         return received
 
     def get_history(self, peer: str = "") -> List[dict]:
         return [h for h in self.vault["history"] if not peer or h["peer"] == peer]
+    
+    
+    def send_file(self, recipient: str, filepath: str) -> None:
+        """Cifra un archivo con Envelope Encryption y envía la DEK protegida por el Ratchet."""
+        
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"No se encontró el archivo local: '{filepath}'")
+       
+        envelope_payload = encrypt_file_envelope(filepath)
+        self.send_message(recipient, envelope_payload)
 
 
 # ----------------------------------------------------------------------
@@ -655,7 +677,8 @@ def main() -> None:
         print("[2] Revisar buzón")
         print("[3] Directorio de contactos (Safety Number / QR / verificación)")
         print("[4] Historial de conversaciones")
-        print("[5] Salir")
+        print("[5] Enviar archivo cifrado")
+        print("[6] Salir")
         cmd = input("> ").strip()
 
         try:
@@ -670,6 +693,10 @@ def main() -> None:
             elif cmd == "4":
                 _history_menu(client)
             elif cmd == "5":
+                dest = input("Destinatario: ").strip()
+                path = input("Ruta del archivo local: ").strip().strip('"')
+                client.send_file(dest, path)
+            elif cmd == "6":
                 print("Bóveda cifrada guardada. Saliendo...")
                 break
             else:
