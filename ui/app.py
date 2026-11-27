@@ -41,10 +41,18 @@ class MessagePayload(BaseModel):
     recipient: str
     text: str
     
+class ContactPayload(BaseModel):
+    peer: str
+    
 class VerifyPayload(BaseModel):
     peer: str
     code: str
-
+    
+class FileUploadPayload(BaseModel):
+    recipient: str
+    filename: str
+    content_b64: str
+    
 
 def _require_client() -> SecureClient:
     if _active_client is None:
@@ -78,22 +86,29 @@ def authenticate(payload: AuthPayload):
         candidate = SecureClient(username, payload.password)
         try:
             if payload.action == "register":
-                candidate.register
+                candidate.register()
+                if not os.path.exists(f"{username}_vault.json"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No se pudo registrar (verifica que el servidor :8000 esté activo o prueba otro usuario).",
+                    )
             elif payload.action != "login":
                 raise HTTPException(
                     status_code=400,
-                    detail="Accion invalida"
+                    detail="Accion invalida",
                 )
             candidate.login()
             _active_client = candidate
             return {
                 "status": "ok",
-                "username": candidate.username
-                }
+                "username": candidate.username,
+            }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
-                detail=str(exc)
+                detail=str(exc),
             )
 
 
@@ -141,6 +156,45 @@ def send_message(payload: MessagePayload):
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+
+@app.post("/api/files")
+def send_file(payload: FileUploadPayload):
+    client = _require_client()
+    safe_name = os.path.basename(payload.filename) or "adjunto.bin"
+    with _lock:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_file = Path(tmpdir) / safe_name
+            tmp_file.write_bytes(base64.b64decode(payload.content_b64))
+            try:
+                client.send_file(payload.recipient.strip(), str(tmp_file))
+                return {"status": "sent", "filename": safe_name}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            
+@app.get("/api/downloads/{filename}")
+def download_received_file(filename: str):
+    client = _require_client()
+    safe_name = os.path.basename(filename)
+    file_path = Path(f"downloads_{client.username}") / safe_name
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Archivo no encontrado en descargas locales.")
+    return FileResponse(path=file_path, filename=safe_name)
+
+
+@app.post("/api/contacts")
+def add_contact(payload: ContactPayload):
+    client = _require_client()
+    peer = payload.peer.strip()
+    with _lock:
+        if not client.add_contact(peer):
+            raise HTTPException(status_code=404, detail=f"No se pudo añadir a '{peer}'.")
+        sn = client.get_safety_number(peer)
+        return {
+            "peer": peer,
+            "verified": client.is_verified(peer),
+            "safety_number": sn,
+            "qr_payload": build_qr_payload(client.username, peer, sn) if sn else "",
+        }
 
 
 @app.post("/api/contacts/verify")
