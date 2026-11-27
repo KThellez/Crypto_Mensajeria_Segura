@@ -161,10 +161,15 @@ def send_message(payload: MessagePayload):
 def send_file(payload: FileUploadPayload):
     client = _require_client()
     safe_name = os.path.basename(payload.filename) or "adjunto.bin"
+    raw_bytes = base64.b64decode(payload.content_b64)
     with _lock:
+        send_dir = Path(f"sent_{client.username}")
+        send_dir.mkdir(exist_ok=True)
+        (send_dir / safe_name).write_bytes(raw_bytes)
+        
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_file = Path(tmpdir) / safe_name
-            tmp_file.write_bytes(base64.b64decode(payload.content_b64))
+            tmp_file.write_bytes(raw_bytes)
             try:
                 client.send_file(payload.recipient.strip(), str(tmp_file))
                 return {"status": "sent", "filename": safe_name}
@@ -175,9 +180,12 @@ def send_file(payload: FileUploadPayload):
 def download_received_file(filename: str):
     client = _require_client()
     safe_name = os.path.basename(filename)
-    file_path = Path(f"downloads_{client.username}") / safe_name
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Archivo no encontrado en descargas locales.")
+    
+    for folder in (f"downloads_{client.username}", f"sent_{client.username}"):
+        file_path = Path(folder) / safe_name
+        if file_path.is_file():
+            return FileResponse(path=file_path, filename=safe_name)
+        
     return FileResponse(path=file_path, filename=safe_name)
 
 

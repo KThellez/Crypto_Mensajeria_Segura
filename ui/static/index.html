@@ -290,6 +290,7 @@
 
     function selectPeer(peer) {
       selectedPeer = peer;
+      lastHistoryKey = "";
       document.getElementById("chat-screen").classList.add("in-chat");
       document.getElementById("msg-input").disabled = false;
       document.getElementById("send-btn").disabled = false;
@@ -343,14 +344,19 @@
 
     function renderMessages(history) {
       const box = document.getElementById("messages-box");
+
+      const currentKey = `${selectedPeer}:${history.length}:${history.length ? history[history.length - 1].ts + history[history.length - 1].text : ""}`;
+      if (currentKey === lastHistoryKey) return; // No destruye el <audio> si no hay cambios
+      lastHistoryKey = currentKey;
+
       const wasAtBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
       if (!history.length) {
         box.innerHTML = `<div class="empty-hint">No hay mensajes aún con @${selectedPeer}.</div>`;
         return;
       }
       box.innerHTML = history.map(m => {
-        let downloadHtml = "";
-        const match = m.dir === "IN" && m.text.match(/^\[ARCHIVO ADJUNTO\] '([^']+)'/);
+        let mediaHtml = "";
+        const match = m.text.match(/^\[ARCHIVO (?:ADJUNTO|ENVIADO)\] '([^']+)'/);
         if (match) {
           const fname = match[1];
           const url = `/api/downloads/${encodeURIComponent(fname)}`;
@@ -359,14 +365,17 @@
           if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
             preview = `<img src="${url}" alt="${escapeHtml(fname)}" style="max-width:100%; border-radius:8px; margin-top:.45rem; display:block;" />`;
           } else if (["mp3", "wav", "ogg", "m4a"].includes(ext)) {
-            preview = `<audio controls src="${url}" style="width:100%; margin-top:.45rem; height:34px;"></audio>`;
+            preview = `<audio controls src="${url}" style="width:100%; min-width:220px; margin-top:.45rem; height:36px;"></audio>`;
           }
-          downloadHtml = `${preview}<div><a class="dl-link" href="${url}" download>⬇ Descargar ${escapeHtml(fname)}</a></div>`;
+          const dlBtn = m.dir === "IN"
+            ? `<div><a class="dl-link" href="${url}" download>⬇ Descargar ${escapeHtml(fname)}</a></div>`
+            : "";
+          mediaHtml = `${preview}${dlBtn}`;
         }
         return `
           <div class="msg ${m.dir}">
             <div>${escapeHtml(m.text)}</div>
-            ${downloadHtml}
+            ${mediaHtml}
             <div class="msg-meta">${m.ts}</div>
           </div>
         `;
