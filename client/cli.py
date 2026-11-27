@@ -7,6 +7,7 @@ Propósito: Cliente interactivo de consola con bóveda cifrada local, X3DH, Ratc
 import base64
 import getpass
 import hmac
+import json
 import os
 from datetime import datetime
 from typing import Dict, List, Optional

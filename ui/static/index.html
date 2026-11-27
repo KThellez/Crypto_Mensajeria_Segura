@@ -40,9 +40,11 @@
       cursor: pointer; border: none; border-radius: 8px; padding: .65rem 1rem;
       font-weight: 600; font-size: .9rem; transition: .15s;
     }
+    button:disabled { opacity: .45; cursor: not-allowed; }
     .btn-primary { background: var(--accent); color: #fff; flex: 1; }
-    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
     .btn-secondary { background: var(--panel-alt); color: var(--text); flex: 1; }
+    .btn-ok { background: var(--ok); color: #06281e; }
     .error-msg { color: var(--danger); font-size: .82rem; margin-top: .75rem; min-height: 1.1rem; }
 
     /* Layout Principal */
@@ -87,6 +89,11 @@
     .msg.OUT { align-self: flex-end; background: var(--bubble-out); border-bottom-right-radius: 3px; }
     .msg.IN { align-self: flex-start; background: var(--bubble-in); border-bottom-left-radius: 3px; }
     .msg-meta { font-size: .68rem; color: rgba(255,255,255,.65); margin-top: .25rem; text-align: right; }
+    .dl-link {
+      display: inline-block; margin-top: .45rem; padding: .35rem .65rem; border-radius: 6px;
+      background: rgba(15,23,42,.55); color: #93c5fd; text-decoration: none; font-size: .8rem; font-weight: 600;
+    }
+    .dl-link:hover { background: rgba(15,23,42,.85); }
     .composer {
       padding: .75rem; background: var(--panel); border-top: 1px solid var(--panel-alt);
       display: flex; gap: .5rem; align-items: center;
@@ -95,7 +102,29 @@
       flex: 1; padding: .65rem .85rem; border-radius: 999px; border: 1px solid var(--panel-alt);
       background: var(--bg); color: var(--text); font-size: .95rem;
     }
+    .icon-btn {
+      background: var(--panel-alt); color: var(--text); border-radius: 999px;
+      padding: .6rem .85rem; font-size: 1rem; flex: 0;
+    }
     .empty-hint { margin: auto; color: var(--muted); font-size: .9rem; text-align: center; padding: 1rem; }
+
+    /* Modal Safety Number / QR */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7);
+      align-items: center; justify-content: center; padding: 1rem; z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--panel); width: 100%; max-width: 440px; border-radius: 14px;
+      padding: 1.4rem; border: 1px solid var(--panel-alt); box-shadow: 0 15px 35px rgba(0,0,0,.5);
+    }
+    .modal h2 { font-size: 1.1rem; margin-bottom: .35rem; }
+    .modal p { font-size: .82rem; color: var(--muted); margin-bottom: .9rem; line-height: 1.4; }
+    .code-box {
+      background: var(--bg); border: 1px solid var(--panel-alt); border-radius: 8px;
+      padding: .75rem; font-family: monospace; font-size: .88rem; letter-spacing: .04em;
+      word-break: break-all; margin-bottom: .75rem; color: #38bdf8;
+    }
 
     /* Responsive Móvil */
     @media (max-width: 720px) {
@@ -152,6 +181,9 @@
           <strong id="chat-peer-title">Selecciona un contacto</strong>
           <span id="chat-peer-badge"></span>
         </div>
+        <button id="verify-open-btn" class="btn-secondary" style="display:none; flex:0; padding:.4rem .75rem; font-size:.8rem" onclick="openVerifyModal()">
+          Verificar / QR
+        </button>
       </div>
 
       <div id="messages-box" class="messages">
@@ -159,10 +191,42 @@
       </div>
 
       <form class="composer" onsubmit="sendMessage(event)">
+        <input id="file-picker" type="file" style="display:none" onchange="handleFileSelected(event)" />
+        <button id="attach-btn" class="icon-btn" type="button" title="Enviar archivo cifrado" onclick="document.getElementById('file-picker').click()" disabled>📎</button>
         <input id="msg-input" type="text" placeholder="Escribe un mensaje cifrado..." disabled />
         <button id="send-btn" class="btn-primary" style="flex:0; border-radius:999px" type="submit" disabled>Enviar</button>
       </form>
     </main>
+  </div>
+
+  <!-- 3. Modal Verificación de Identidad (Safety Number / QR) -->
+  <div id="verify-modal" class="modal-backdrop">
+    <div class="modal">
+      <h2>Verificar identidad de <span id="modal-peer-name">@peer</span></h2>
+      <p>Compara este <strong>Safety Number</strong> (o su cadena QR) con tu contacto fuera de banda para descartar un ataque MITM.</p>
+
+      <div class="field">
+        <label>Safety Number (Ed25519 + X25519)</label>
+        <div id="modal-sn" class="code-box">---</div>
+      </div>
+
+      <div class="field">
+        <label>Payload QR (E2EE-SN)</label>
+        <div id="modal-qr" class="code-box" style="font-size:.76rem; color:#a7f3d0">---</div>
+      </div>
+
+      <div class="field">
+        <label>Pega el Safety Number / QR recibido de tu contacto (o escribe "manual")</label>
+        <input id="verify-code-input" type="text" placeholder="Pega el código aquí o escribe: manual" />
+      </div>
+
+      <div id="verify-error" class="error-msg" style="margin-top:0; margin-bottom:.6rem"></div>
+
+      <div class="btn-row">
+        <button class="btn-secondary" type="button" onclick="closeVerifyModal()">Cerrar</button>
+        <button class="btn-ok" type="button" style="flex:1" onclick="submitVerification()">Confirmar verificación</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -229,6 +293,8 @@
       document.getElementById("chat-screen").classList.add("in-chat");
       document.getElementById("msg-input").disabled = false;
       document.getElementById("send-btn").disabled = false;
+      document.getElementById("attach-btn").disabled = false;
+      document.getElementById("verify-open-btn").style.display = "inline-block";
       refreshState();
     }
 
@@ -282,12 +348,29 @@
         box.innerHTML = `<div class="empty-hint">No hay mensajes aún con @${selectedPeer}.</div>`;
         return;
       }
-      box.innerHTML = history.map(m => `
-        <div class="msg ${m.dir}">
-          <div>${escapeHtml(m.text)}</div>
-          <div class="msg-meta">${m.ts}</div>
-        </div>
-      `).join("");
+      box.innerHTML = history.map(m => {
+        let downloadHtml = "";
+        const match = m.dir === "IN" && m.text.match(/^\[ARCHIVO ADJUNTO\] '([^']+)'/);
+        if (match) {
+          const fname = match[1];
+          const url = `/api/downloads/${encodeURIComponent(fname)}`;
+          const ext = fname.split(".").pop().toLowerCase();
+          let preview = "";
+          if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+            preview = `<img src="${url}" alt="${escapeHtml(fname)}" style="max-width:100%; border-radius:8px; margin-top:.45rem; display:block;" />`;
+          } else if (["mp3", "wav", "ogg", "m4a"].includes(ext)) {
+            preview = `<audio controls src="${url}" style="width:100%; margin-top:.45rem; height:34px;"></audio>`;
+          }
+          downloadHtml = `${preview}<div><a class="dl-link" href="${url}" download>⬇ Descargar ${escapeHtml(fname)}</a></div>`;
+        }
+        return `
+          <div class="msg ${m.dir}">
+            <div>${escapeHtml(m.text)}</div>
+            ${downloadHtml}
+            <div class="msg-meta">${m.ts}</div>
+          </div>
+        `;
+      }).join("");
       if (wasAtBottom) box.scrollTop = box.scrollHeight;
     }
 
@@ -306,6 +389,66 @@
         await refreshState();
       } catch (err) {
         alert(err.message);
+      }
+    }
+
+    function handleFileSelected(e) {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (!file || !selectedPeer) return;
+
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const b64 = reader.result.split(",")[1];
+        try {
+          await api("/api/files", {
+            method: "POST",
+            body: JSON.stringify({
+              recipient: selectedPeer,
+              filename: file.name,
+              content_b64: b64
+            })
+          });
+          await refreshState();
+        } catch (err) {
+          alert(err.message);
+        }
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function openVerifyModal() {
+      const info = contactsCache.find(c => c.peer === selectedPeer);
+      if (!info) return;
+      document.getElementById("modal-peer-name").textContent = `@${selectedPeer}`;
+      document.getElementById("modal-sn").textContent = info.safety_number || "No disponible";
+      document.getElementById("modal-qr").textContent = info.qr_payload || "No disponible";
+      document.getElementById("verify-code-input").value = "";
+      document.getElementById("verify-error").textContent = "";
+      document.getElementById("verify-modal").classList.add("open");
+    }
+
+    function closeVerifyModal() {
+      document.getElementById("verify-modal").classList.remove("open");
+    }
+
+    async function submitVerification() {
+      const code = document.getElementById("verify-code-input").value.trim();
+      const errBox = document.getElementById("verify-error");
+      errBox.textContent = "";
+      if (!code) {
+        errBox.textContent = "Ingresa el código del contacto o escribe 'manual'.";
+        return;
+      }
+      try {
+        await api("/api/contacts/verify", {
+          method: "POST",
+          body: JSON.stringify({ peer: selectedPeer, code })
+        });
+        closeVerifyModal();
+        await refreshState();
+      } catch (err) {
+        errBox.textContent = err.message;
       }
     }
 
