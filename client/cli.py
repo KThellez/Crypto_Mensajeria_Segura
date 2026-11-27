@@ -37,9 +37,30 @@ from client.crypto_utils import (
 )
 from client.session import ChatSession, EncryptedPacket, PreKeyBundle
 
-SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:8000")
-# Certificado autofirmado del servidor (Docker/TLS). Si no se define, se usa la CA del sistema.
-SSL_CERT_FILE = os.getenv("SSL_CERT_FILE")
+# busca la carpeta raíz del proyecto
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _default_ssl_cert_file() -> Optional[str]:
+    """
+    Busca certs/cert.pem en la carpeta actual o en la raíz del proyecto.
+    """
+    for candidate in (os.path.join("certs", "cert.pem"),
+                      os.path.join(_REPO_ROOT, "certs", "cert.pem")):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _default_server_url() -> str:
+    """
+    Usa HTTPS por defecto si existe el certificado TLS; si no, HTTP local.
+    """
+    return "https://127.0.0.1:8000" if _default_ssl_cert_file() else "http://127.0.0.1:8000"
+
+
+SERVER_URL = os.getenv("SERVER_URL") or _default_server_url()
+SSL_CERT_FILE = os.getenv("SSL_CERT_FILE") or _default_ssl_cert_file()
 
 QR_PREFIX = "E2EE-SN"
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -452,8 +473,13 @@ class SecureClient:
             f"{SERVER_URL}/messages", json=payload, headers=self._auth_headers(), **_http_kwargs()
         )
         if res.status_code == 201:
+            history_text = text
+            if text.startswith(FILE_ENVELOPE_PREFIX):
+                meta = json.loads(text[len(FILE_ENVELOPE_PREFIX):])
+                history_text = f"[ARCHIVO ENVIADO] '{meta['filename']}' ({meta['size']} bytes)"
+                
             self.vault["history"].append(
-                {"dir": "OUT", "peer": recipient, "text": text, "ts": _now()}
+                {"dir": "OUT", "peer": recipient, "text": history_text, "ts": _now()}
             )
             self._save_state()
             print(f"[ENVIADO a @{recipient} {self.badge(recipient)} | n={packet.counter}]")
