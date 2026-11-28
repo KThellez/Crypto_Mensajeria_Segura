@@ -67,21 +67,31 @@
     .contact-list { flex: 1; overflow-y: auto; }
     .contact-item {
       padding: .85rem 1rem; border-bottom: 1px solid rgba(255,255,255,.05);
-      cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+      cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: .4rem;
     }
     .contact-item:hover, .contact-item.active { background: var(--panel-alt); }
-    .pill { font-size: .7rem; padding: .15rem .45rem; border-radius: 999px; font-weight: 600; }
+    .contact-sub { display: block; font-size: .7rem; color: var(--muted); margin-top: .15rem; }
+    .pill { font-size: .68rem; padding: .18rem .5rem; border-radius: 999px; font-weight: 600; white-space: nowrap; }
     .pill-ok { background: rgba(16,185,129,.2); color: var(--ok); }
     .pill-warn { background: rgba(245,158,11,.2); color: var(--warn); }
+    .pill-crypto { background: rgba(56,189,248,.14); color: #38bdf8; border: 1px solid rgba(56,189,248,.3); }
 
     /* Panel de Conversación */
-    .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg); }
+    .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg); position: relative; }
     .chat-header {
       padding: .85rem 1rem; background: var(--panel); border-bottom: 1px solid var(--panel-alt);
-      display: flex; justify-content: space-between; align-items: center; gap: .5rem;
+      display: flex; justify-content: space-between; align-items: center; gap: .5rem; flex-wrap: wrap;
     }
     .back-btn { display: none; background: var(--panel-alt); color: var(--text); padding: .4rem .7rem; }
-    .messages { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .6rem; }
+    .messages {
+      flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .6rem;
+      transition: background .15s, outline .15s;
+    }
+    .messages.drag-over {
+      background: rgba(59,130,246,.12);
+      outline: 2px dashed var(--accent);
+      outline-offset: -8px;
+    }
     .msg {
       max-width: 78%; padding: .6rem .85rem; border-radius: 12px; font-size: .92rem; line-height: 1.35;
       word-wrap: break-word;
@@ -94,9 +104,23 @@
       background: rgba(15,23,42,.55); color: #93c5fd; text-decoration: none; font-size: .8rem; font-weight: 600;
     }
     .dl-link:hover { background: rgba(15,23,42,.85); }
+
+    /* Barra de escritura + Emoji picker */
+    .composer-wrap { position: relative; }
+    .emoji-popover {
+      display: none; position: absolute; bottom: 100%; left: .75rem; margin-bottom: .4rem;
+      background: var(--panel); border: 1px solid var(--panel-alt); border-radius: 12px;
+      padding: .5rem; grid-template-columns: repeat(8, 1fr); gap: .25rem;
+      box-shadow: 0 10px 25px rgba(0,0,0,.45); z-index: 30;
+    }
+    .emoji-popover.open { display: grid; }
+    .emoji-btn {
+      background: transparent; padding: .35rem; font-size: 1.15rem; border-radius: 6px;
+    }
+    .emoji-btn:hover { background: var(--panel-alt); }
     .composer {
       padding: .75rem; background: var(--panel); border-top: 1px solid var(--panel-alt);
-      display: flex; gap: .5rem; align-items: center;
+      display: flex; gap: .45rem; align-items: center;
     }
     .composer input[type="text"] {
       flex: 1; padding: .65rem .85rem; border-radius: 999px; border: 1px solid var(--panel-alt);
@@ -104,7 +128,7 @@
     }
     .icon-btn {
       background: var(--panel-alt); color: var(--text); border-radius: 999px;
-      padding: .6rem .85rem; font-size: 1rem; flex: 0;
+      padding: .6rem .8rem; font-size: 1rem; flex: 0;
     }
     .empty-hint { margin: auto; color: var(--muted); font-size: .9rem; text-align: center; padding: 1rem; }
 
@@ -115,11 +139,18 @@
     }
     .modal-backdrop.open { display: flex; }
     .modal {
-      background: var(--panel); width: 100%; max-width: 440px; border-radius: 14px;
+      background: var(--panel); width: 100%; max-width: 450px; border-radius: 14px;
       padding: 1.4rem; border: 1px solid var(--panel-alt); box-shadow: 0 15px 35px rgba(0,0,0,.5);
     }
     .modal h2 { font-size: 1.1rem; margin-bottom: .35rem; }
     .modal p { font-size: .82rem; color: var(--muted); margin-bottom: .9rem; line-height: 1.4; }
+    .label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: .3rem; }
+    .label-row label { margin-bottom: 0; }
+    .copy-btn {
+      background: var(--panel-alt); color: var(--text); font-size: .72rem;
+      padding: .2rem .55rem; border-radius: 6px;
+    }
+    .copy-btn:hover { background: var(--accent); }
     .code-box {
       background: var(--bg); border: 1px solid var(--panel-alt); border-radius: 8px;
       padding: .75rem; font-family: monospace; font-size: .88rem; letter-spacing: .04em;
@@ -163,7 +194,7 @@
       <div class="sidebar-header">
         <div class="user-badge">
           <span id="me-name">@usuario</span>
-          <span>● E2EE activo</span>
+          <span>● Bóveda E2EE activa</span>
         </div>
         <button class="btn-secondary" style="flex:0; padding:.4rem .7rem; font-size:.8rem" onclick="logout()">Salir</button>
       </div>
@@ -176,10 +207,11 @@
 
     <main class="main-chat">
       <div class="chat-header">
-        <div style="display:flex; align-items:center; gap:.5rem">
+        <div style="display:flex; align-items:center; gap:.5rem; flex-wrap:wrap">
           <button class="back-btn" onclick="closeChatMobile()">←</button>
           <strong id="chat-peer-title">Selecciona un contacto</strong>
           <span id="chat-peer-badge"></span>
+          <span id="crypto-pill" class="pill pill-crypto" style="display:none">🔒 AES-256-GCM · X3DH</span>
         </div>
         <button id="verify-open-btn" class="btn-secondary" style="display:none; flex:0; padding:.4rem .75rem; font-size:.8rem" onclick="openVerifyModal()">
           Verificar / QR
@@ -187,15 +219,19 @@
       </div>
 
       <div id="messages-box" class="messages">
-        <div class="empty-hint">Selecciona o agrega un contacto para iniciar una sesión X3DH.</div>
+        <div class="empty-hint">Selecciona o agrega un contacto para iniciar una sesión X3DH.<br><small>También puedes arrastrar y soltar archivos aquí para cifrarlos.</small></div>
       </div>
 
-      <form class="composer" onsubmit="sendMessage(event)">
-        <input id="file-picker" type="file" style="display:none" onchange="handleFileSelected(event)" />
-        <button id="attach-btn" class="icon-btn" type="button" title="Enviar archivo cifrado" onclick="document.getElementById('file-picker').click()" disabled>📎</button>
-        <input id="msg-input" type="text" placeholder="Escribe un mensaje cifrado..." disabled />
-        <button id="send-btn" class="btn-primary" style="flex:0; border-radius:999px" type="submit" disabled>Enviar</button>
-      </form>
+      <div class="composer-wrap">
+        <div id="emoji-popover" class="emoji-popover"></div>
+        <form class="composer" onsubmit="sendMessage(event)">
+          <input id="file-picker" type="file" style="display:none" onchange="handleFileSelected(event)" />
+          <button id="attach-btn" class="icon-btn" type="button" title="Adjuntar archivo cifrado" onclick="document.getElementById('file-picker').click()" disabled>📎</button>
+          <button id="emoji-toggle-btn" class="icon-btn" type="button" title="Emoticones" onclick="toggleEmojis()" disabled>😊</button>
+          <input id="msg-input" type="text" placeholder="Escribe un mensaje cifrado..." disabled />
+          <button id="send-btn" class="btn-primary" style="flex:0; border-radius:999px" type="submit" disabled>Enviar</button>
+        </form>
+      </div>
     </main>
   </div>
 
@@ -206,12 +242,18 @@
       <p>Compara este <strong>Safety Number</strong> (o su cadena QR) con tu contacto fuera de banda para descartar un ataque MITM.</p>
 
       <div class="field">
-        <label>Safety Number (Ed25519 + X25519)</label>
+        <div class="label-row">
+          <label>Safety Number (Ed25519 + X25519)</label>
+          <button type="button" class="copy-btn" onclick="copyText('modal-sn', this)">Copiar</button>
+        </div>
         <div id="modal-sn" class="code-box">---</div>
       </div>
 
       <div class="field">
-        <label>Payload QR (E2EE-SN)</label>
+        <div class="label-row">
+          <label>Payload QR (E2EE-SN)</label>
+          <button type="button" class="copy-btn" onclick="copyText('modal-qr', this)">Copiar</button>
+        </div>
         <div id="modal-qr" class="code-box" style="font-size:.76rem; color:#a7f3d0">---</div>
       </div>
 
@@ -234,6 +276,52 @@
     let selectedPeer = null;
     let contactsCache = [];
     let pollTimer = null;
+    let lastHistoryKey = "";
+
+    const EMOJIS = ["👋", "😂", "🔥", "🔒", "🔑", "🛡️", "✅", "⚠️", "🧀", "🎵", "📸", "🚀", "👍", "👀", "🤝", "🎉"];
+
+    // Inicializar paleta de emojis y Drag & Drop
+    (function initExtras() {
+      const pop = document.getElementById("emoji-popover");
+      pop.innerHTML = EMOJIS.map(e =>
+        `<button type="button" class="emoji-btn" onclick="insertEmoji('${e}')">${e}</button>`
+      ).join("");
+
+      const box = document.getElementById("messages-box");
+      ["dragenter", "dragover"].forEach(ev => box.addEventListener(ev, e => {
+        e.preventDefault();
+        if (selectedPeer) box.classList.add("drag-over");
+      }));
+      ["dragleave", "drop"].forEach(ev => box.addEventListener(ev, e => {
+        e.preventDefault();
+        box.classList.remove("drag-over");
+      }));
+      box.addEventListener("drop", e => {
+        if (!selectedPeer || !e.dataTransfer.files.length) return;
+        uploadFile(e.dataTransfer.files[0]);
+      });
+    })();
+
+    function toggleEmojis() {
+      document.getElementById("emoji-popover").classList.toggle("open");
+    }
+
+    function insertEmoji(emoji) {
+      const input = document.getElementById("msg-input");
+      input.value += emoji;
+      input.focus();
+      document.getElementById("emoji-popover").classList.remove("open");
+    }
+
+    async function copyText(elementId, btn) {
+      const text = document.getElementById(elementId).textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        const orig = btn.textContent;
+        btn.textContent = "¡Copiado!";
+        setTimeout(() => { btn.textContent = orig; }, 1400);
+      } catch (_) {}
+    }
 
     async function api(url, options = {}) {
       const res = await fetch(url, {
@@ -295,7 +383,9 @@
       document.getElementById("msg-input").disabled = false;
       document.getElementById("send-btn").disabled = false;
       document.getElementById("attach-btn").disabled = false;
+      document.getElementById("emoji-toggle-btn").disabled = false;
       document.getElementById("verify-open-btn").style.display = "inline-block";
+      document.getElementById("crypto-pill").style.display = "inline-block";
       refreshState();
     }
 
@@ -321,7 +411,10 @@
       const list = document.getElementById("contact-list");
       list.innerHTML = contacts.map(c => `
         <div class="contact-item ${c.peer === selectedPeer ? "active" : ""}" onclick="selectPeer('${c.peer}')">
-          <span>@${c.peer}</span>
+          <div>
+            <strong>@${c.peer}</strong>
+            <span class="contact-sub">${c.has_session ? "🔑 Sesión X3DH activa" : "⏳ Sin sesión iniciada"}</span>
+          </div>
           <span class="pill ${c.verified ? "pill-ok" : "pill-warn"}">
             ${c.verified ? "VERIFICADO" : "NO VERIFICADO"}
           </span>
@@ -344,14 +437,13 @@
 
     function renderMessages(history) {
       const box = document.getElementById("messages-box");
-
       const currentKey = `${selectedPeer}:${history.length}:${history.length ? history[history.length - 1].ts + history[history.length - 1].text : ""}`;
-      if (currentKey === lastHistoryKey) return; // No destruye el <audio> si no hay cambios
+      if (currentKey === lastHistoryKey) return;
       lastHistoryKey = currentKey;
 
       const wasAtBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
       if (!history.length) {
-        box.innerHTML = `<div class="empty-hint">No hay mensajes aún con @${selectedPeer}.</div>`;
+        box.innerHTML = `<div class="empty-hint">No hay mensajes aún con @${selectedPeer}.<br><small>Escribe un mensaje o arrastra un archivo aquí para cifrarlo con X3DH + AES-256-GCM.</small></div>`;
         return;
       }
       box.innerHTML = history.map(m => {
@@ -386,6 +478,7 @@
     async function sendMessage(e) {
       e.preventDefault();
       if (!selectedPeer) return;
+      document.getElementById("emoji-popover").classList.remove("open");
       const input = document.getElementById("msg-input");
       const text = input.value.trim();
       if (!text) return;
@@ -404,8 +497,11 @@
     function handleFileSelected(e) {
       const file = e.target.files[0];
       e.target.value = "";
-      if (!file || !selectedPeer) return;
+      if (file) uploadFile(file);
+    }
 
+    function uploadFile(file) {
+      if (!selectedPeer) return;
       const reader = new FileReader();
       reader.onload = async () => {
         const b64 = reader.result.split(",")[1];
